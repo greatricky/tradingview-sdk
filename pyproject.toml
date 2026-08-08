@@ -1,0 +1,42 @@
+[project]
+name = "tradingview-sdk"
+version = "0.1.0"
+description = "Unofficial Python SDK for TradingView: quotes, streaming prices, historical bars, screeners, and community strategies"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "greatricky", email = "greatricky@users.noreply.github.com" },
+]
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=12.0",
+    "selectolax>=0.3",
+]
+
+[project.optional-dependencies]
+# Only needed for BarSet.to_dataframe(), which imports pandas lazily.
+pandas = ["pandas>=2.0"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pandas>=2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tradingview_sdk"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not live'"
+markers = [
+    "live: tests that hit real TradingView endpoints (run with: pytest -m live)",
+]
+asyncio_mode = "auto"
+testpaths = ["tests"]

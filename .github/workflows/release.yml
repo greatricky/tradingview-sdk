@@ -1,0 +1,57 @@
+name: release
+
+# Tag a version (vX.Y.Z) -> build, publish to PyPI, then create the GitHub Release.
+#
+# Ordered for atomicity: every cheap check runs first as a gate; PyPI (the one
+# irreversible step) publishes only after they pass and is made idempotent with
+# --check-url; the reversible GitHub Release is created last, so its existence
+# means the whole release succeeded. The single job is safe to re-run.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      # -- gate: nothing external happens until all of these pass --------------
+      - name: Verify tag matches package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(grep -m1 -E '^version[[:space:]]*=' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "tag=$TAG package=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Tag v$TAG does not match pyproject version $PKG"
+            exit 1
+          fi
+
+      - name: Run offline tests
+        run: uv run pytest
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      # -- irreversible commit: PyPI (idempotent via --check-url) --------------
+      - name: Publish to PyPI
+        run: uv publish --check-url https://pypi.org/simple/ --token "${{ secrets.PYPI_API_TOKEN }}"
+
+      # -- reversible marker: GitHub Release, created last ---------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
