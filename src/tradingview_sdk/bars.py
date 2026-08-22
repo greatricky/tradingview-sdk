@@ -159,9 +159,16 @@ async def fetch_bars(
             if len(load.collected) == before:
                 break  # exhausted: the server has nothing older to give
 
-            # A load round finished — decide whether to page further back.
+            # A load round finished — decide whether to page further back. Only bars
+            # that survive the `end` filter count toward the target, otherwise
+            # `bars=300, end=<a year ago>` stops on 300 recent bars and returns none.
             earliest = min(load.collected) if load.collected else None
-            have_enough_count = start_ts is None and len(load.collected) >= bars
+            usable = (
+                len(load.collected)
+                if end_ts is None
+                else sum(1 for t in load.collected if t <= end_ts)
+            )
+            have_enough_count = start_ts is None and usable >= bars
             reached_start = start_ts is not None and earliest is not None and earliest <= start_ts
             if have_enough_count or reached_start or rounds >= _MAX_ROUNDS:
                 break

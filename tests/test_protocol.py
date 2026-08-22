@@ -6,6 +6,7 @@ from tradingview_sdk._protocol import (
     generate_session_id,
     is_heartbeat,
     parse_json_message,
+    utf16_len,
     wrap_raw,
 )
 
@@ -58,22 +59,37 @@ def test_decode_tolerates_trailing_garbage():
     assert decode_frame(good + "junk") == decode_frame(good)
 
 
-def test_length_prefix_counts_bytes_not_characters():
-    # The server frames non-ASCII payloads (CJK names, "Société Générale") by byte
-    # length; slicing by characters truncates the message and desyncs everything
-    # after it in the same frame. Built here the way the server sends it.
-    payload = json.dumps({"m": "qsd", "p": [{"n": "Société Générale"}]}, ensure_ascii=False)
-    assert len(payload.encode("utf-8")) > len(payload)  # the test is only meaningful if so
-    wire = f"~m~{len(payload.encode('utf-8'))}~m~{payload}" + encode_message("after", [1])
+def test_length_prefix_counts_utf16_code_units_not_bytes():
+    # Captured verbatim from production: the payload is 99 characters and 113 UTF-8
+    # bytes, and the server declares 99 — JavaScript's String.length. Reading the
+    # prefix as a byte count truncates the JSON and desyncs the rest of the frame.
+    payload = (
+        '{"m":"qsd","p":["qs_vvg85v09ah13",{"n":"KRX:005930","s":"ok",'
+        '"v":{"local_description":"\uc0bc\uc131\uc804\uc790\ubcf4\ud1b5\uc8fc"}}]}'
+    )
+    assert len(payload) == 99 and len(payload.encode("utf-8")) == 113
 
+    wire = f"~m~99~m~{payload}" + encode_message("after", [1])
     messages = decode_frame(wire)
     assert len(messages) == 2
-    assert parse_json_message(messages[0])["p"][0]["n"] == "Société Générale"
+    assert json.loads(messages[0])["p"][1]["v"]["local_description"] == "\uc0bc\uc131\uc804\uc790\ubcf4\ud1b5\uc8fc"
     assert parse_json_message(messages[1])["m"] == "after"
 
 
-def test_wrap_raw_prefixes_the_byte_length():
-    assert wrap_raw("Société") == "~m~9~m~Société"  # 7 characters, 9 UTF-8 bytes
+def test_astral_characters_count_as_two_units():
+    # Outside the BMP, JavaScript counts a surrogate pair as 2 while Python's len()
+    # counts 1, so plain character slicing would come up short.
+    payload = '{"n":"\U0001f680"}'
+    assert len(payload) == 9 and utf16_len(payload) == 10
+
+    wire = f"~m~{utf16_len(payload)}~m~{payload}" + wrap_raw("~h~3")
+    messages = decode_frame(wire)
+    assert messages == [payload, "~h~3"]
+
+
+def test_wrap_raw_prefixes_the_utf16_length():
+    assert wrap_raw("Société") == "~m~7~m~Société"      # 7 chars, 9 UTF-8 bytes
+    assert wrap_raw("~h~42") == "~m~5~m~~h~42"
 
 
 def test_decode_accepts_raw_bytes():
@@ -86,3 +102,14 @@ def test_session_id_shape():
     assert sid.startswith("qs_")
     assert len(sid) == 3 + 12
     assert sid != generate_session_id("qs")
+
+
+def test_ascii_frames_skip_the_astral_scan():
+    # _has_astral must short-circuit on the cached ASCII flag: scanning every frame
+    # with max() is ~10^6 times more expensive and pointless for ASCII payloads.
+    from tradingview_sdk._protocol import _has_astral
+
+    assert _has_astral("") is False
+    assert _has_astral('{"a":1}') is False
+    assert _has_astral("삼성전자") is False          # BMP: one char, one code unit
+    assert _has_astral('{"n":"🚀"}') is True

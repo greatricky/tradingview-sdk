@@ -187,3 +187,19 @@ def test_barstream_forming_then_close():
         (400, 401.0, False),
     ]
     assert series.last_time == 400
+
+
+def test_unparseable_points_are_skipped_and_logged(caplog):
+    from tradingview_sdk._chart import parse_series_bars
+
+    params = ["cs", {"sds_1": {"s": [
+        {"i": 0, "v": [100, 1.0, 2.0, 0.5, 1.5, 10.0]},
+        {"i": 1, "v": [200, None, None, None, None, 0]},   # hypothetical gap bar
+        {"i": 2, "v": [300]},                               # too short
+        "not-a-dict",
+        {"i": 3, "v": [400, 1.0, 2.0, 0.5, 1.9, None]},     # null volume is legal
+    ]}}]
+    bars = parse_series_bars(params, "sds_1")
+    assert [b.time for b in bars] == [100, 400]
+    assert bars[1].volume is None
+    assert any("skipped 3 unparseable bar point(s) of 5" in r.getMessage() for r in caplog.records)

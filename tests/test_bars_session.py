@@ -169,3 +169,14 @@ async def test_bar_stream_handshake_updates_and_close():
     methods = [m["m"] for m in server.received]
     assert methods[:2] == ["set_auth_token", "chart_create_session"]
     assert "create_series" in methods
+
+
+async def test_end_without_start_pages_back_to_fill_the_count():
+    # Bars newer than `end` are discarded by the filter, so they must not satisfy the
+    # count target — otherwise the call returns far fewer bars than asked for, or none.
+    server = FakeChartServer(history=60, per_round=5)
+    end = NEWEST - 20 * BAR_SECONDS
+    result = await asyncio.wait_for(_fetch(server, interval="1D", bars=5, end=end), timeout=20)
+    assert len(result) == 5
+    assert all(b.time <= end for b in result)
+    assert result.bars[-1].time == end

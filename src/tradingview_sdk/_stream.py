@@ -114,7 +114,34 @@ class _StreamBase(Generic[U]):
         if self._supervisor_task is None:
             self._supervisor_task = asyncio.create_task(self._supervise(), name=self._task_name)
         if wait_connected:
-            await asyncio.wait_for(self._connected.wait(), timeout)
+            await self._wait_connected(timeout)
+
+    async def _wait_connected(self, timeout: float) -> None:
+        """Wait for the first connection, or for the supervisor to give up trying.
+
+        With ``reconnect=False`` an unreachable endpoint ends the supervisor straight
+        away; waiting on the event alone would stall for the whole timeout first.
+        """
+        assert self._supervisor_task is not None
+        waiter = asyncio.ensure_future(self._connected.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {waiter, self._supervisor_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            waiter.cancel()
+        if waiter in done:
+            return
+        if self._supervisor_task in done:
+            # Retrieve the exception (if any) so it is not reported as never-retrieved,
+            # and carry it as the cause.
+            cause = None if self._supervisor_task.cancelled() else self._supervisor_task.exception()
+            raise StreamClosedError(
+                f"{self._closed_message}: could not connect to {self._url}"
+            ) from cause
+        raise TimeoutError(f"timed out after {timeout}s connecting to {self._url}")
 
     async def close(self) -> None:
         """Terminally close the stream; iterators end, no reconnects."""
@@ -129,8 +156,38 @@ class _StreamBase(Generic[U]):
         await self._close_ws()
         if self._supervisor_task is not None:
             self._supervisor_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await self._supervisor_task
+            except asyncio.CancelledError:
+                # Expected: we just cancelled it. But if the caller cancelled *us*
+                # while we waited, that cancellation has to keep propagating.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+            except Exception:  # noqa: BLE001
+                # close() runs from __aexit__, where raising would replace whatever
+                # exception the caller's `async with` body was already propagating.
+                logger.exception("connection supervisor failed during close")
+        await self._drain_callbacks()
+        self._wake_consumers()
+
+    async def _drain_callbacks(self, grace: float = 1.0) -> None:
+        """Let in-flight async callbacks finish, then cancel whatever is still running.
+
+        Without this they outlive the stream and surface as "Task was destroyed but
+        it is pending" once the loop shuts down.
+        """
+        pending = set(self._callback_tasks)
+        if not pending:
+            return
+        _, still_running = await asyncio.wait(pending, timeout=grace)
+        for task in still_running:
+            task.cancel()
+        if still_running:
+            await asyncio.wait(still_running)
+
+    def _wake_consumers(self) -> None:
+        """End every registered iterator."""
         for _, queue in self._queues:
             self._offer(queue, CLOSED)
 
@@ -241,8 +298,7 @@ class _StreamBase(Generic[U]):
             await asyncio.sleep(delay)
         # terminal exit: wake all consumers
         self._closed = True
-        for _, queue in self._queues:
-            self._offer(queue, CLOSED)
+        self._wake_consumers()
 
     async def _connect_and_run(self) -> None:
         token = await resolve_ws_token(self._auth)
@@ -292,7 +348,12 @@ class _StreamBase(Generic[U]):
         if method in FATAL_METHODS:
             logger.warning("server sent %s: %s", method, str(params)[:200])
             raise ConnectionError(f"TradingView sent {method}")
-        self._handle_data(method, params)
+        try:
+            self._handle_data(method, params)
+        except Exception:  # noqa: BLE001
+            # Dropping the socket over one bad payload forces a full reconnect and
+            # resubscribe, and repeats for every replay of that payload.
+            logger.exception("could not handle %s message", method)
 
     # ----------------------------------------------------- subclass contract
 

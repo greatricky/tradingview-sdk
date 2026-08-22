@@ -1,10 +1,15 @@
 """TradingView websocket wire protocol: ``~m~<len>~m~<payload>`` framing.
 
-``<len>`` counts *bytes* of the UTF-8 payload, not characters, so framing is done
-on bytes throughout. A single non-ASCII character anywhere in a frame (a
-``description`` like "Société Générale", a CJK instrument name) otherwise makes
-every character-based slice land short, truncating that message and desyncing
-the reader for the rest of the frame.
+``<len>`` is the payload's length as JavaScript's ``String.length`` reports it —
+UTF-16 code units, *not* bytes. Verified against production: a ``qsd`` frame
+carrying ``"local_description":"삼성전자보통주"`` declares ``~m~99~m~`` for a
+payload of 99 characters / 113 UTF-8 bytes, and reading the prefix as a byte
+count truncates the JSON and desyncs the rest of the frame.
+
+For every character in the Basic Multilingual Plane — which covers TradingView's
+instrument names, CJK included — one code unit is one Python character, so plain
+slicing is exact. Only astral characters (emoji, U+10000 and above) count as two
+units in JavaScript and one in Python, and those take the slower walk below.
 """
 
 from __future__ import annotations
@@ -15,45 +20,82 @@ import re
 import string
 from typing import Any
 
-_FRAME_RE = re.compile(rb"~m~(\d+)~m~")
+_FRAME_RE = re.compile(r"~m~(\d+)~m~")
 _HEARTBEAT_RE = re.compile(r"^~h~\d+$")
 
 WS_URL = "wss://data.tradingview.com/socket.io/websocket?from=chart%2F&type=chart"
 WS_ORIGIN = "https://www.tradingview.com"
 
 
-def _framed(payload: str) -> str:
-    return f"~m~{len(payload.encode('utf-8'))}~m~{payload}"
+def utf16_len(text: str) -> int:
+    """Length in UTF-16 code units — what the server's ``String.length`` counts."""
+    if text.isascii():
+        return len(text)
+    return len(text.encode("utf-16-le")) // 2
 
 
 def encode_message(method: str, params: list[Any]) -> str:
     """Encode one protocol message.
 
-    ``ensure_ascii=True`` keeps the payload ASCII-only, which TradingView's own
-    client does too; the length prefix is computed in bytes either way.
+    ``ensure_ascii=True`` keeps the payload ASCII-only, so the length prefix is
+    unambiguous no matter how the receiver counts it.
     """
     payload = json.dumps({"m": method, "p": params}, separators=(",", ":"), ensure_ascii=True)
-    return _framed(payload)
+    return f"~m~{len(payload)}~m~{payload}"
 
 
 def wrap_raw(payload: str) -> str:
     """Wrap an already-serialized payload (e.g. a heartbeat echo)."""
-    return _framed(payload)
+    return f"~m~{utf16_len(payload)}~m~{payload}"
 
 
 def decode_frame(frame: str | bytes) -> list[str]:
     """Split one websocket frame into its ``~m~``-framed payloads."""
-    raw = frame.encode("utf-8") if isinstance(frame, str) else frame
+    text = frame.decode("utf-8", "replace") if isinstance(frame, (bytes, bytearray)) else frame
+    if _has_astral(text):
+        return _decode_utf16(text)
+    return _decode_chars(text)
+
+
+def _has_astral(text: str) -> bool:
+    """True if any character sits outside the BMP, where JS counts two code units.
+
+    ``isascii()`` is a cached flag on the string object, so the overwhelmingly common
+    all-ASCII frame costs nothing; only the rare non-ASCII frame pays the scan.
+    """
+    return not text.isascii() and bool(text) and max(text) > "\uffff"
+
+
+def _decode_chars(text: str) -> list[str]:
     messages: list[str] = []
     pos = 0
-    while pos < len(raw):
-        m = _FRAME_RE.match(raw, pos)
+    while pos < len(text):
+        m = _FRAME_RE.match(text, pos)
         if not m:
             # Tolerate trailing garbage rather than dropping the whole frame.
             break
         start = m.end()
         end = start + int(m.group(1))
-        messages.append(raw[start:end].decode("utf-8", "replace"))
+        messages.append(text[start:end])
+        pos = end
+    return messages
+
+
+def _decode_utf16(text: str) -> list[str]:
+    """Slice by UTF-16 code units, counting astral characters as the server does."""
+    messages: list[str] = []
+    pos = 0
+    while pos < len(text):
+        m = _FRAME_RE.match(text, pos)
+        if not m:
+            break
+        units = int(m.group(1))
+        start = end = m.end()
+        consumed = 0
+        while end < len(text) and consumed < units:
+            consumed += 2 if text[end] > "￿" else 1
+            end += 1
+        messages.append(text[start:end])
         pos = end
     return messages
 

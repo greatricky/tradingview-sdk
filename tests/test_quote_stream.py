@@ -10,6 +10,7 @@ import websockets
 
 from tradingview_sdk import _stream
 from tradingview_sdk._protocol import decode_frame, parse_json_message, wrap_raw
+from tradingview_sdk.errors import StreamClosedError
 from tradingview_sdk.ws import QuoteStream
 
 
@@ -236,3 +237,94 @@ async def test_slow_consumer_drops_oldest(fake_server):
     assert queue.get_nowait() == 3
     assert queue.get_nowait() == 4
     await stream.close()
+
+
+async def test_start_fails_fast_when_the_supervisor_gives_up():
+    # reconnect=False on an unreachable endpoint: start() must report the failure
+    # instead of waiting out its whole connect timeout.
+    stream = QuoteStream(url="ws://127.0.0.1:1/nope", reconnect=False)
+    started = time.monotonic()
+    with pytest.raises(StreamClosedError, match="could not connect"):
+        await stream.start(timeout=20.0)
+    assert time.monotonic() - started < 5.0
+    await stream.close()
+
+
+async def test_close_drains_in_flight_async_callbacks(fake_server):
+    _, url = fake_server
+    entered = asyncio.Event()
+    finished = []
+
+    async def slow_handler(update):
+        entered.set()
+        await asyncio.sleep(0.05)
+        finished.append(update.symbol)
+
+    stream = QuoteStream(url=url)
+    await stream.start()
+    stream.on_update(slow_handler)
+    await stream.subscribe("A:B")
+    async with asyncio.timeout(5):
+        await entered.wait()
+    await stream.close()
+    # the handler ran to completion rather than being orphaned by close()
+    assert finished
+    assert not stream._callback_tasks
+
+
+async def test_bad_message_does_not_drop_the_connection(fake_server):
+    _, url = fake_server
+    stream = QuoteStream(url=url)
+    await stream.start()
+    boom = {"n": 0}
+
+    def exploding(method, params):
+        boom["n"] += 1
+        raise RuntimeError("bad payload")
+
+    stream._handle_data = exploding
+    await stream.subscribe("A:B")
+    async with asyncio.timeout(5):
+        while boom["n"] < 1:
+            await asyncio.sleep(0.01)
+    await asyncio.sleep(0.2)
+    # still on the original connection: no teardown, no resubscribe cycle
+    assert stream._ws is not None
+    assert not stream.is_closed
+    await stream.close()
+
+
+async def test_close_does_not_mask_the_callers_exception(caplog):
+    # close() runs from __aexit__; raising there would replace whatever the
+    # `async with` body was already propagating.
+    stream = QuoteStream(url="ws://127.0.0.1:1/nope", reconnect=False)
+
+    async def boom():
+        raise RuntimeError("supervisor blew up")
+
+    stream._supervisor_task = asyncio.create_task(boom())
+    await asyncio.sleep(0.05)
+    await stream.close()  # must not raise
+    assert any("supervisor failed during close" in r.getMessage() for r in caplog.records)
+
+
+async def test_close_still_propagates_the_callers_cancellation():
+    # close() swallows the supervisor's CancelledError because it cancelled it —
+    # but must not swallow a cancellation aimed at the task running close().
+    stream = QuoteStream(url="ws://127.0.0.1:1/nope", reconnect=False)
+
+    async def slow():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.3)
+            raise
+
+    stream._supervisor_task = asyncio.create_task(slow())
+    await asyncio.sleep(0.05)
+
+    task = asyncio.create_task(stream.close())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

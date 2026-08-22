@@ -12,9 +12,12 @@ split used by ``quotes.py`` and ``screener.py``.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from .models import Bar
+
+logger = logging.getLogger("tradingview_sdk.chart")
 
 SYMBOL_ID = "sds_sym_1"
 SERIES_ID = "sds_1"
@@ -63,10 +66,11 @@ def request_more_data_params(chart_session: str, count: int, *, series_id: str =
 def _bar_from_values(values: list[Any]) -> Bar | None:
     """Turn one ``{"v": [time, open, high, low, close, volume]}`` array into a :class:`Bar`.
 
-    Returns None for an unusable point instead of raising: TradingView sends nulls
-    in the price slots for gap/no-trade bars, and one of those must not take down
-    the whole load (or, in :class:`~tradingview_sdk.bar_stream.BarStream`, the
-    whole connection).
+    Returns None for an unusable point rather than raising. Every point observed in
+    production has been fully numeric, so this is defensive: were that to change, one
+    bad point must not fail a whole ``get_bars`` call or — worse — tear down a
+    :class:`~tradingview_sdk.bar_stream.BarStream` connection and reconnect on every
+    replay of it. ``parse_series_bars`` logs whatever it drops.
     """
     if not isinstance(values, list) or len(values) < 5:
         return None
@@ -96,12 +100,19 @@ def parse_series_bars(params: list[Any], series_id: str = SERIES_ID) -> list[Bar
     if not isinstance(series, dict):
         return []
     bars: list[Bar] = []
+    skipped = 0
     for point in series.get("s") or []:
         if not isinstance(point, dict):
+            skipped += 1
             continue
         bar = _bar_from_values(point.get("v"))
-        if bar is not None:
+        if bar is None:
+            skipped += 1
+        else:
             bars.append(bar)
+    if skipped:
+        # Never seen in practice; a burst of these means the payload shape moved.
+        logger.warning("skipped %d unparseable bar point(s) of %d", skipped, skipped + len(bars))
     return bars
 
 

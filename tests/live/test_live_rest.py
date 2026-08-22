@@ -3,6 +3,7 @@
 import pytest
 
 from tradingview_sdk import AsyncTradingView, Filter, ScreenerQuery, TradingView
+from tradingview_sdk.errors import SymbolNotFoundError
 
 pytestmark = pytest.mark.live
 
@@ -27,6 +28,31 @@ def test_get_quote(tv):
 def test_get_quote_bare_symbol(tv):
     quote = tv.get_quote("MSFT")
     assert quote.symbol == "NASDAQ:MSFT"
+    assert quote.last and quote.last > 0
+
+
+def test_unknown_symbol_raises_symbol_not_found(tv):
+    """Guards the ``no_404=true`` request param.
+
+    With it, an unknown symbol comes back as ``200 null``; without it the endpoint
+    404s and the SDK would surface HTTPStatusError instead. If TradingView ever
+    stops honouring the param, this is what catches it.
+    """
+    with pytest.raises(SymbolNotFoundError):
+        tv.get_quote("NASDAQ:ZZZZZZZZ")
+
+
+def test_routing_prefix_is_used_for_full_symbol(tv):
+    """Some listings display one exchange but are addressed under another.
+
+    BYMA's CEDEARs quote as BCBA:AAPL; BYMA:AAPL does not exist upstream.
+    """
+    results = tv.search_symbols("AAPL", search_type=None)
+    prefixed = [s for s in results if s.prefix and s.prefix != s.exchange]
+    assert prefixed, "expected at least one listing whose routing prefix differs"
+    for info in prefixed:
+        assert info.full_symbol.startswith(f"{info.prefix}:")
+    quote = tv.get_quote("BCBA:AAPL")
     assert quote.last and quote.last > 0
 
 
