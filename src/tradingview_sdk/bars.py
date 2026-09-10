@@ -40,14 +40,15 @@ DEFAULT_BARS = 300
 _PER_REQUEST = 5000     # bars asked for per create_series / request_more_data round
 _MAX_ROUNDS = 20        # safety cap on request_more_data pagination
 _CLOSE_GRACE = 1.0      # seconds spent on the closing handshake before dropping the socket
+_DEADLINE_FLOOR = 30.0  # smallest derived total deadline, however tight `timeout` is
 
 DEFAULT_BAR_TIMEOUT = 5.0
 """Default silence watchdog for one chart session, in seconds.
 
-This is *not* a total deadline. It bounds the websocket handshake and then each
-wait for the next inbound frame, so a server that accepts the connection and then
-says nothing costs about this much per attempt (plus :data:`_CLOSE_GRACE` to drop
-the socket) instead of hanging. A healthy
+It bounds the websocket handshake and then each wait for the next frame that
+carries protocol *progress*, so a server that accepts the connection and then
+stops making progress costs about this much per attempt (plus
+:data:`_CLOSE_GRACE` to drop the socket) instead of hanging. A healthy
 server answers ``create_series`` in well under a second and pauses at most a few
 hundred milliseconds between frames even mid-pagination, so 5s fires only on a
 real stall. It is deliberately tighter than the long-lived streaming client's
@@ -60,6 +61,17 @@ that is the granularity ``recv()`` offers. A 5000-bar load round arrives as one
 ~520 KB frame, which needs a link under roughly 1 Mbps to take 5s — so on a
 congested or tethered connection a large ``start=`` range may need a bigger
 ``timeout`` even though the server is healthy.
+
+Heartbeats deliberately do not count as progress. The server sends them every few
+seconds and this client echoes them back to stay connected, so a watchdog re-armed
+on *any* inbound frame would never fire against the session it exists to catch:
+one that is alive and chatty but has stopped delivering bars. That hole widens
+exactly where the paragraph above sends callers — raise ``timeout`` past the
+server's heartbeat interval and an all-heartbeat session becomes unbounded.
+
+This is still not a total deadline: it re-arms on every load round, so a server
+that keeps making slow progress can outlive any number of windows. That is what
+``fetch_bars(deadline=...)`` bounds; see :func:`_default_deadline`.
 """
 
 
@@ -113,6 +125,32 @@ def to_epoch(value: datetime | date | int | float | None) -> int | None:
     raise TypeError(f"start/end must be a datetime, date, or epoch seconds, not {type(value).__name__}")
 
 
+def _default_deadline(timeout: float) -> float:
+    """Total wall-clock backstop for one chart session, derived from ``timeout``.
+
+    The watchdog alone cannot bound a session: it re-arms on every scrap of progress,
+    so a server that dribbles out one frame just inside each window runs forever
+    without ever being "silent". This is the outer bound on that.
+
+    It covers every wait on the server — the token fetch, the handshake, and each
+    read — which is the whole of a session in practice. It is not a hard cancel: an
+    outbound ``send`` that blocks because the peer has stopped reading its socket
+    sits outside it, which needs a peer that heartbeats at us while refusing tens of
+    kilobytes back, and is not a shape TradingView produces.
+
+    It is deliberately loose — a backstop against a hang, not a service level. The
+    budget is one full watchdog window per pagination round (:data:`_MAX_ROUNDS`),
+    which no healthy fetch comes near spending, floored so that a caller who tightens
+    ``timeout`` for snappy per-frame failure does not silently also buy a total
+    deadline too short for a legitimate multi-round ``start=`` range.
+    """
+    return max(_DEADLINE_FLOOR, timeout * _MAX_ROUNDS)
+
+
+class _DeadlineReached(Exception):
+    """The total deadline expired mid-session. Internal: never escapes ``fetch_bars``."""
+
+
 @dataclass
 class _Load:
     """Everything one chart session accumulates across its load rounds."""
@@ -133,6 +171,7 @@ async def fetch_bars(
     auth: AuthTokenCache,
     url: str = WS_URL,
     timeout: float = DEFAULT_BAR_TIMEOUT,
+    deadline: float | None = None,
 ) -> BarSet:
     """Fetch historical OHLCV bars for ``symbol`` over one chart-session websocket.
 
@@ -141,16 +180,31 @@ async def fetch_bars(
     takes precedence over the ``bars`` count. Times are epoch seconds UTC.
 
     ``timeout`` is the silence watchdog in seconds (see
-    :data:`DEFAULT_BAR_TIMEOUT`), not a total deadline. If the session stalls
-    before any bars arrive this raises :class:`BarTimeoutError`; if it stalls
-    after some arrived, the bars collected so far are returned with
-    ``raw["truncated"] = True`` rather than thrown away, so check that flag before
-    treating a result as a complete answer.
+    :data:`DEFAULT_BAR_TIMEOUT`), applied to the handshake and then to each wait
+    for the next frame that carries progress. ``deadline`` is the total wall clock
+    the whole call may spend, defaulting to :func:`_default_deadline` of ``timeout``;
+    it is what bounds a server that stays busy without ever finishing.
+
+    Both give up the same way. If the session ends before any bars arrive this
+    raises :class:`BarTimeoutError`; if it ends after some arrived, the bars
+    collected so far are returned with ``raw["truncated"] = True`` rather than
+    thrown away, so check that flag before treating a result as a complete answer.
     """
     if timeout is None or timeout <= 0:
         # Reachable from the public get_bars facades: asyncio.timeout(None) would
         # disable the watchdog entirely and <= 0 would fail against a healthy server.
         raise ValueError(f"timeout must be a positive number of seconds, not {timeout!r}")
+    if deadline is None:
+        deadline = _default_deadline(timeout)
+    elif deadline <= 0:
+        # `None` means "derive one", so there is no way to ask for no deadline at all:
+        # an unbounded fetch_bars is the bug this argument exists to make unreachable.
+        raise ValueError(f"deadline must be a positive number of seconds, not {deadline!r}")
+    loop = asyncio.get_running_loop()
+    # Started before the token fetch so `deadline` means what it says for the caller,
+    # rather than only covering the part of the call after the REST round trip.
+    expires_at = loop.time() + deadline
+
     interval = str(interval)
     adjustment = str(adjustment)
     start_ts = to_epoch(start)
@@ -161,18 +215,24 @@ async def fetch_bars(
     initial = _PER_REQUEST if start_ts is not None else min(_PER_REQUEST, max(bars, 1))
 
     # open_timeout defaults to 10s in websockets, which would outlive a 5s watchdog
-    # and surface as a bare TimeoutError; bind both ends of the attempt to `timeout`.
+    # and surface as a bare TimeoutError; bind both ends of the attempt to `timeout`,
+    # or to what is left of the deadline when a caller set one tighter than that.
+    open_timeout = min(timeout, expires_at - loop.time())
+    if open_timeout <= 0:
+        raise BarTimeoutError(
+            f"deadline of {deadline}s expired before the chart session for {symbol!r} opened"
+        )
     try:
         ws = await websockets.connect(
             url,
             additional_headers={"Origin": WS_ORIGIN},
             user_agent_header=BASE_HEADERS["User-Agent"],
             max_size=2**24,
-            open_timeout=timeout,
+            open_timeout=open_timeout,
             close_timeout=_CLOSE_GRACE,
         )
     except TimeoutError as exc:
-        raise BarTimeoutError(f"timed out after {timeout}s connecting to {url}") from exc
+        raise BarTimeoutError(f"timed out after {open_timeout:g}s connecting to {url}") from exc
 
     truncated = False
     try:
@@ -189,40 +249,55 @@ async def fetch_bars(
 
         rounds = 0
         before = -1  # bar count at the previous round; -1 so the first round always counts
-        while True:
-            if not await _read_until_completed(ws, load, timeout):
-                if not load.collected:
-                    raise BarTimeoutError(
-                        f"timed out after {timeout}s waiting for bars of {symbol!r}"
+        try:
+            while True:
+                if not await _read_until_completed(ws, load, timeout, expires_at):
+                    if not load.collected:
+                        raise BarTimeoutError(
+                            f"timed out after {timeout}s waiting for bars of {symbol!r}"
+                        )
+                    # Partial data beats none, but the caller must be able to tell: the
+                    # `start`/`bars` filters below silently hide the shortfall otherwise.
+                    truncated = True
+                    logger.warning(
+                        "chart session for %r went quiet after %d round(s); returning %d bars",
+                        symbol, rounds, len(load.collected),
                     )
-                # Partial data beats none, but the caller must be able to tell: the
-                # `start`/`bars` filters below silently hide the shortfall otherwise.
-                truncated = True
-                logger.warning(
-                    "chart session for %r went quiet after %d round(s); returning %d bars",
-                    symbol, rounds, len(load.collected),
+                    break
+                if len(load.collected) == before:
+                    break  # exhausted: the server has nothing older to give
+
+                # A load round finished — decide whether to page further back. Only bars
+                # that survive the `end` filter count toward the target, otherwise
+                # `bars=300, end=<a year ago>` stops on 300 recent bars and returns none.
+                earliest = min(load.collected) if load.collected else None
+                usable = (
+                    len(load.collected)
+                    if end_ts is None
+                    else sum(1 for t in load.collected if t <= end_ts)
                 )
-                break
-            if len(load.collected) == before:
-                break  # exhausted: the server has nothing older to give
+                have_enough_count = start_ts is None and usable >= bars
+                reached_start = (
+                    start_ts is not None and earliest is not None and earliest <= start_ts
+                )
+                if have_enough_count or reached_start or rounds >= _MAX_ROUNDS:
+                    break
 
-            # A load round finished — decide whether to page further back. Only bars
-            # that survive the `end` filter count toward the target, otherwise
-            # `bars=300, end=<a year ago>` stops on 300 recent bars and returns none.
-            earliest = min(load.collected) if load.collected else None
-            usable = (
-                len(load.collected)
-                if end_ts is None
-                else sum(1 for t in load.collected if t <= end_ts)
+                before = len(load.collected)
+                await send("request_more_data", request_more_data_params(cs, _PER_REQUEST))
+                rounds += 1
+        except _DeadlineReached:
+            # Same bargain as the watchdog above: whatever arrived is worth returning,
+            # flagged, and only an empty session is an error.
+            if not load.collected:
+                raise BarTimeoutError(
+                    f"deadline of {deadline}s expired before any bars of {symbol!r} arrived"
+                ) from None
+            truncated = True
+            logger.warning(
+                "chart session for %r hit its %ss deadline after %d round(s); returning %d bars",
+                symbol, deadline, rounds, len(load.collected),
             )
-            have_enough_count = start_ts is None and usable >= bars
-            reached_start = start_ts is not None and earliest is not None and earliest <= start_ts
-            if have_enough_count or reached_start or rounds >= _MAX_ROUNDS:
-                break
-
-            before = len(load.collected)
-            await send("request_more_data", request_more_data_params(cs, _PER_REQUEST))
-            rounds += 1
     finally:
         await _close_quietly(ws)
 
@@ -268,30 +343,59 @@ async def _close_quietly(ws: Any, grace: float = _CLOSE_GRACE) -> None:
             transport.abort()
 
 
-async def _read_until_completed(ws: Any, load: _Load, timeout: float) -> bool:
+async def _read_until_completed(
+    ws: Any, load: _Load, timeout: float, expires_at: float
+) -> bool:
     """Read frames into ``load`` until the server finishes the current load round.
 
     Returns True on ``series_completed``, False if the connection closed or went
-    quiet first. Both the initial ``create_series`` load and every
+    quiet first, and raises :class:`_DeadlineReached` when the session's total
+    ``expires_at`` passes. Both the initial ``create_series`` load and every
     ``request_more_data`` round go through here, so a completion event can never
     be consumed by one loop while another is still waiting for it.
+
+    The watchdog is anchored to the last frame that carried *progress*, not to the
+    last frame of any kind. Heartbeats arrive on their own schedule and are echoed
+    back, so re-arming on them would let a session that has stopped delivering bars
+    outlive ``timeout`` forever whenever the heartbeat interval is the shorter of
+    the two — a stall that answers "still here" is precisely what the watchdog is
+    for. ``expires_at`` then covers the case the watchdog structurally cannot: real
+    progress that never adds up to a finished round.
 
     An unknown symbol — including a real ticker on the wrong exchange — comes back
     as ``symbol_error`` right after ``resolve_symbol`` and raises immediately, so
     callers never wait out the watchdog for it.
     """
+    loop = asyncio.get_running_loop()
+    quiet_at = loop.time() + timeout
     while True:
+        # Re-checked before every read: a peer that keeps a frame always ready would
+        # otherwise starve the timeout below and spin past the deadline.
+        if loop.time() >= expires_at:
+            raise _DeadlineReached
+        # Compared rather than measured after the fact, so the two cannot be confused
+        # when they land in the same millisecond.
+        deadline_first = expires_at <= quiet_at
         try:
-            async with asyncio.timeout(timeout):
+            async with asyncio.timeout_at(min(quiet_at, expires_at)):
                 frame = await ws.recv()
-        except (TimeoutError, websockets.ConnectionClosed):
+        except TimeoutError:
+            if deadline_first:
+                raise _DeadlineReached from None
+            return False
+        except websockets.ConnectionClosed:
             return False
 
         completed = False
+        progressed = False
         for message in decode_frame(frame):
             if is_heartbeat(message):
                 await ws.send(wrap_raw(message))
                 continue
+            # Anything that is not a heartbeat is the server doing work, including
+            # payloads this client does not parse — the watchdog asks whether the
+            # session is advancing, not whether we understood the latest frame.
+            progressed = True
             data = parse_json_message(message)
             if data is None:
                 continue
@@ -318,3 +422,5 @@ async def _read_until_completed(ws: Any, load: _Load, timeout: float) -> bool:
                 )
         if completed:
             return True
+        if progressed:
+            quiet_at = loop.time() + timeout

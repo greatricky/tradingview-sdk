@@ -429,7 +429,7 @@ wheels = [
 
 [[package]]
 name = "tradingview-sdk"
-version = "0.3.1"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -453,8 +453,8 @@ dev = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "pandas", marker = "extra == 'pandas'", specifier = ">=2.0" },
-    { name = "selectolax", specifier = ">=0.3" },
-    { name = "websockets", specifier = ">=12.0" },
+    { name = "selectolax", specifier = ">=0.3.10" },
+    { name = "websockets", specifier = ">=14.0" },
 ]
 provides-extras = ["pandas"]
 

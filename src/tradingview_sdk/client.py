@@ -117,6 +117,7 @@ class AsyncTradingView:
         end: datetime | date | int | float | None = None,
         adjustment: str | Adjustment = Adjustment.SPLITS,
         timeout: float = DEFAULT_BAR_TIMEOUT,
+        deadline: float | None = None,
     ) -> BarSet:
         """Historical OHLCV bars for "EXCHANGE:TICKER" (bare tickers are resolved via search).
 
@@ -128,10 +129,22 @@ class AsyncTradingView:
         call's websocket silence watchdog, separate from the constructor's ``timeout``,
         which is the HTTP read timeout for the REST endpoints. Raising one does not
         raise the other. It bounds the chart-session handshake and each wait for the
-        next frame, so a stalled server costs ~``timeout`` plus a one-second close
-        grace per attempt and raises :class:`~tradingview_sdk.BarTimeoutError`. It does not cover the REST work that
-        may precede the session: resolving a bare ticker through ``search_symbols`` and
-        the first websocket-token fetch both run under the constructor's ``timeout``.
+        next frame that carries progress — heartbeats do not count, so a session that
+        stays chatty without delivering bars still trips it — and a stalled server
+        costs ~``timeout`` plus a one-second close grace per attempt, raising
+        :class:`~tradingview_sdk.BarTimeoutError`.
+
+        ``timeout`` re-arms on every load round, so it bounds a stall but not the call.
+        ``deadline`` is the total seconds the chart session may spend, defaulting to a
+        loose backstop derived from ``timeout`` — high enough that a legitimate
+        multi-round ``start=`` range never meets it, present so that a server which
+        stays busy without ever finishing cannot hang the caller. Bars that already
+        arrived come back with ``raw["truncated"] = True`` either way.
+
+        Neither one covers resolving a bare ticker through ``search_symbols``, which
+        happens before the session opens and runs under the constructor's ``timeout``.
+        ``deadline`` does cover the websocket-token fetch, since that is the session's
+        own first step; ``timeout`` does not.
 
         An unknown symbol, or a real ticker on the wrong exchange, raises
         ``SymbolNotFoundError`` as soon as the server rejects it — typically well under
@@ -147,6 +160,7 @@ class AsyncTradingView:
             adjustment=adjustment,
             auth=self._auth,
             timeout=timeout,
+            deadline=deadline,
         )
 
     async def _resolve_symbol(self, symbol: str) -> str:
@@ -273,11 +287,15 @@ class TradingView:
         end: datetime | date | int | float | None = None,
         adjustment: str | Adjustment = Adjustment.SPLITS,
         timeout: float = DEFAULT_BAR_TIMEOUT,
+        deadline: float | None = None,
     ) -> BarSet:
         """See :meth:`AsyncTradingView.get_bars`.
 
         ``timeout`` is the websocket silence watchdog for this call (default
-        :data:`~tradingview_sdk.DEFAULT_BAR_TIMEOUT`), not the constructor's HTTP timeout.
+        :data:`~tradingview_sdk.DEFAULT_BAR_TIMEOUT`), not the constructor's HTTP timeout;
+        ``deadline`` is the total wall clock the chart session may spend. This form
+        blocks a thread for the duration, so the bound matters more here than in the
+        async one.
         """
         symbol = self._resolve_symbol(symbol)
         return run_coro_blocking(
@@ -290,6 +308,7 @@ class TradingView:
                 adjustment=adjustment,
                 auth=self._auth,
                 timeout=timeout,
+                deadline=deadline,
             )
         )
 

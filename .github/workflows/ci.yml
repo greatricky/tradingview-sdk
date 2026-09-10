@@ -26,3 +26,31 @@ jobs:
 
       - name: Run offline tests
         run: uv run --python ${{ matrix.python-version }} pytest
+
+  # The `test` job installs from uv.lock, which pins the newest resolution — so a
+  # declared floor that no longer matches the code (`websockets>=12` after the
+  # asyncio-client kwargs went in) passes there and only breaks users. This job
+  # resolves the runtime dependencies to their lowest allowed versions instead,
+  # which is the one thing that exercises the floors we publish.
+  lowest-direct:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Deliberately not `uv sync`/`uv run` without --no-sync: both would restore
+      # uv.lock and quietly test the newest versions again. Test tooling is left at
+      # its newest, and the `pandas` extra out entirely — its one test importorskips,
+      # and pinning it low only reproduces pandas' own numpy-2 ABI break, not ours.
+      - name: Install the lowest allowed runtime dependencies
+        run: |
+          uv venv
+          uv pip install --resolution lowest-direct .
+          uv pip install pytest pytest-asyncio
+
+      - name: Run offline tests
+        run: uv run --no-sync pytest
