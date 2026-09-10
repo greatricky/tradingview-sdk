@@ -31,7 +31,7 @@ from ._protocol import (
     wrap_raw,
 )
 from .auth import AuthTokenCache, resolve_ws_token
-from .errors import ProtocolError, SymbolNotFoundError
+from .errors import BarTimeoutError, ProtocolError, SymbolNotFoundError
 from .models import Bar, BarSet
 
 logger = logging.getLogger("tradingview_sdk.bars")
@@ -39,7 +39,28 @@ logger = logging.getLogger("tradingview_sdk.bars")
 DEFAULT_BARS = 300
 _PER_REQUEST = 5000     # bars asked for per create_series / request_more_data round
 _MAX_ROUNDS = 20        # safety cap on request_more_data pagination
-_RECV_TIMEOUT = 20.0    # watchdog: no inbound frame for this long => give up
+_CLOSE_GRACE = 1.0      # seconds spent on the closing handshake before dropping the socket
+
+DEFAULT_BAR_TIMEOUT = 5.0
+"""Default silence watchdog for one chart session, in seconds.
+
+This is *not* a total deadline. It bounds the websocket handshake and then each
+wait for the next inbound frame, so a server that accepts the connection and then
+says nothing costs about this much per attempt (plus :data:`_CLOSE_GRACE` to drop
+the socket) instead of hanging. A healthy
+server answers ``create_series`` in well under a second and pauses at most a few
+hundred milliseconds between frames even mid-pagination, so 5s fires only on a
+real stall. It is deliberately tighter than the long-lived streaming client's
+watchdog (:data:`~tradingview_sdk._stream.RECV_TIMEOUT`, 30s): that one
+reconnects and resumes, while a one-shot fetch just gives up, so waiting longer
+buys nothing and callers who try several exchanges per symbol pay it each time.
+
+Each wait covers a whole websocket message rather than idle time alone, because
+that is the granularity ``recv()`` offers. A 5000-bar load round arrives as one
+~520 KB frame, which needs a link under roughly 1 Mbps to take 5s — so on a
+congested or tethered connection a large ``start=`` range may need a bigger
+``timeout`` even though the server is healthy.
+"""
 
 
 class Interval(StrEnum):
@@ -111,14 +132,25 @@ async def fetch_bars(
     adjustment: str | Adjustment = Adjustment.SPLITS,
     auth: AuthTokenCache,
     url: str = WS_URL,
-    timeout: float = _RECV_TIMEOUT,
+    timeout: float = DEFAULT_BAR_TIMEOUT,
 ) -> BarSet:
     """Fetch historical OHLCV bars for ``symbol`` over one chart-session websocket.
 
     ``bars`` is the number of most-recent bars to return. Pass ``start`` (and
     optionally ``end``) to page back until that time is covered; ``start`` then
     takes precedence over the ``bars`` count. Times are epoch seconds UTC.
+
+    ``timeout`` is the silence watchdog in seconds (see
+    :data:`DEFAULT_BAR_TIMEOUT`), not a total deadline. If the session stalls
+    before any bars arrive this raises :class:`BarTimeoutError`; if it stalls
+    after some arrived, the bars collected so far are returned with
+    ``raw["truncated"] = True`` rather than thrown away, so check that flag before
+    treating a result as a complete answer.
     """
+    if timeout is None or timeout <= 0:
+        # Reachable from the public get_bars facades: asyncio.timeout(None) would
+        # disable the watchdog entirely and <= 0 would fail against a healthy server.
+        raise ValueError(f"timeout must be a positive number of seconds, not {timeout!r}")
     interval = str(interval)
     adjustment = str(adjustment)
     start_ts = to_epoch(start)
@@ -128,12 +160,22 @@ async def fetch_bars(
     load = _Load(symbol=symbol)
     initial = _PER_REQUEST if start_ts is not None else min(_PER_REQUEST, max(bars, 1))
 
-    async with websockets.connect(
-        url,
-        additional_headers={"Origin": WS_ORIGIN},
-        user_agent_header=BASE_HEADERS["User-Agent"],
-        max_size=2**24,
-    ) as ws:
+    # open_timeout defaults to 10s in websockets, which would outlive a 5s watchdog
+    # and surface as a bare TimeoutError; bind both ends of the attempt to `timeout`.
+    try:
+        ws = await websockets.connect(
+            url,
+            additional_headers={"Origin": WS_ORIGIN},
+            user_agent_header=BASE_HEADERS["User-Agent"],
+            max_size=2**24,
+            open_timeout=timeout,
+            close_timeout=_CLOSE_GRACE,
+        )
+    except TimeoutError as exc:
+        raise BarTimeoutError(f"timed out after {timeout}s connecting to {url}") from exc
+
+    truncated = False
+    try:
         cs = generate_session_id("cs")
 
         async def send(method: str, params: list[Any]) -> None:
@@ -150,7 +192,12 @@ async def fetch_bars(
         while True:
             if not await _read_until_completed(ws, load, timeout):
                 if not load.collected:
-                    raise ProtocolError(f"timed out waiting for bars of {symbol!r}")
+                    raise BarTimeoutError(
+                        f"timed out after {timeout}s waiting for bars of {symbol!r}"
+                    )
+                # Partial data beats none, but the caller must be able to tell: the
+                # `start`/`bars` filters below silently hide the shortfall otherwise.
+                truncated = True
                 logger.warning(
                     "chart session for %r went quiet after %d round(s); returning %d bars",
                     symbol, rounds, len(load.collected),
@@ -176,6 +223,8 @@ async def fetch_bars(
             before = len(load.collected)
             await send("request_more_data", request_more_data_params(cs, _PER_REQUEST))
             rounds += 1
+    finally:
+        await _close_quietly(ws)
 
     collected = load.collected
     ordered = [collected[t] for t in sorted(collected)]
@@ -191,8 +240,32 @@ async def fetch_bars(
         interval=interval,
         bars=tuple(ordered),
         currency=load.currency,
-        raw={"chart_session_rounds": rounds, "bar_count": len(ordered)},
+        raw={
+            "chart_session_rounds": rounds,
+            "bar_count": len(ordered),
+            "truncated": truncated,
+        },
     )
+
+
+async def _close_quietly(ws: Any, grace: float = _CLOSE_GRACE) -> None:
+    """Close the socket without letting a stalled peer bill the caller for it.
+
+    A server that went silent mid-session tends to ignore the closing handshake too,
+    and websockets then waits out its own ``close_timeout`` — dead time stacked on
+    top of the watchdog the caller asked for, which is what made a stall cost 15s
+    against a 5s ``timeout``. Give the handshake a short grace, then drop the
+    transport; this is a one-shot session that is being torn down regardless.
+    """
+    try:
+        async with asyncio.timeout(grace):
+            await ws.close()
+    except (TimeoutError, OSError, websockets.WebSocketException):
+        pass
+    finally:
+        transport = getattr(ws, "transport", None)
+        if transport is not None:
+            transport.abort()
 
 
 async def _read_until_completed(ws: Any, load: _Load, timeout: float) -> bool:
@@ -202,6 +275,10 @@ async def _read_until_completed(ws: Any, load: _Load, timeout: float) -> bool:
     quiet first. Both the initial ``create_series`` load and every
     ``request_more_data`` round go through here, so a completion event can never
     be consumed by one loop while another is still waiting for it.
+
+    An unknown symbol — including a real ticker on the wrong exchange — comes back
+    as ``symbol_error`` right after ``resolve_symbol`` and raises immediately, so
+    callers never wait out the watchdog for it.
     """
     while True:
         try:
@@ -228,7 +305,13 @@ async def _read_until_completed(ws: Any, load: _Load, timeout: float) -> bool:
             elif method == "series_completed":
                 completed = True  # finish the frame first: more bars may follow it
             elif method == "symbol_error":
-                raise SymbolNotFoundError(f"TradingView could not resolve symbol {load.symbol!r}")
+                # `params` is only guaranteed to be JSON, so index it defensively: a
+                # dict-shaped payload would raise KeyError past a bare len() check.
+                reason = params[2] if isinstance(params, list) and len(params) > 2 else None
+                raise SymbolNotFoundError(
+                    f"TradingView could not resolve symbol {load.symbol!r}"
+                    + (f": {str(reason)[:200]}" if reason else "")
+                )
             elif method in ("series_error", "critical_error", "protocol_error"):
                 raise ProtocolError(
                     f"TradingView sent {method} for {load.symbol!r}: {str(params)[:200]}"

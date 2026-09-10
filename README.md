@@ -107,6 +107,7 @@ with TradingView() as tv:
   Splits are always applied (there is no split-off mode), and the latest bar is identical either way — only historical bars change.
 - Each `Bar` has `time` (epoch seconds, UTC), `open`/`high`/`low`/`close`/`volume`, and a `.datetime` (aware UTC). `BarSet` is iterable/indexable with `.last`, `.closes`, `.times`, … and a lazy `.to_dataframe()` (needs pandas only if you call it). Bar times are always UTC, and a naive `start`/`end` `datetime` is interpreted as UTC.
 - Bars load over a websocket chart session; anonymous access returns delayed data (log in for realtime — see [Authentication](#authentication-optional)).
+- `timeout` (default 5s) is a silence watchdog on the websocket session, not a total deadline — a stalled server raises `BarTimeoutError`, the one bars failure worth retrying. A wrong ticker or exchange raises `SymbolNotFoundError` straight away, and a range that stalls midway returns what it got with `raw["truncated"] == True`.
 
 **Streaming bars** — `BarStream` mirrors `QuoteStream` for live, updating candles:
 
@@ -236,8 +237,8 @@ Tagging a version runs `.github/workflows/release.yml`, which builds and publish
 
 ```bash
 # bump `version` in pyproject.toml (the single source of truth), then:
-git commit -am "Release v0.2.0"
-git tag v0.2.0
+git commit -am "Release v0.3.0"
+git tag v0.3.0
 git push origin main --tags
 ```
 
@@ -245,7 +246,7 @@ The workflow guards that the tag matches the package version, runs the offline t
 
 ## Error handling
 
-All errors derive from `TradingViewError`: `HTTPStatusError` (with `RateLimitError` for 429 and `AuthRequiredError` for 401/403), `SymbolNotFoundError`, `ParseError` (markup drift), `ProtocolError`, and `StreamClosedError`. Every model keeps the raw payload on `.raw` so new upstream fields remain accessible.
+All errors derive from `TradingViewError`: `HTTPStatusError` (with `RateLimitError` for 429 and `AuthRequiredError` for 401/403), `SymbolNotFoundError`, `ParseError` (markup drift), `ProtocolError` (with `BarTimeoutError` for a chart session that stalled — the one bars failure worth retrying), and `StreamClosedError`. Every model keeps the raw payload on `.raw` so new upstream fields remain accessible.
 
 ## License
 

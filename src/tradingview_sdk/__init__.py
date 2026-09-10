@@ -18,6 +18,7 @@ from .fields import (
 )
 from .errors import (
     AuthRequiredError,
+    BarTimeoutError,
     HTTPStatusError,
     ParseError,
     ProtocolError,
@@ -42,7 +43,7 @@ from .models import (
     StrategyStats,
     SymbolInfo,
 )
-from .bars import DEFAULT_BARS, Adjustment, Interval, fetch_bars
+from .bars import DEFAULT_BAR_TIMEOUT, DEFAULT_BARS, Adjustment, Interval, fetch_bars
 from .bar_stream import BarStream
 from .quotes import DEFAULT_QUOTE_FIELDS
 from .scripts import SCRIPT_TYPES
@@ -89,6 +90,7 @@ __all__ = [
     "DEFAULT_QUOTE_FIELDS",
     "DEFAULT_WS_FIELDS",
     "DEFAULT_BARS",
+    "DEFAULT_BAR_TIMEOUT",
     "SCRIPT_TYPES",
     # models
     "SymbolInfo",
@@ -113,5 +115,6 @@ __all__ = [
     "SymbolNotFoundError",
     "ParseError",
     "ProtocolError",
+    "BarTimeoutError",
     "StreamClosedError",
 ]

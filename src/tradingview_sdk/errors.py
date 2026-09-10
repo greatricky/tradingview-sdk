@@ -47,5 +47,20 @@ class ProtocolError(TradingViewError):
     """Malformed websocket frame or unexpected protocol message."""
 
 
+class BarTimeoutError(ProtocolError, TimeoutError):
+    """A chart session went silent past its watchdog before any bars arrived.
+
+    This is the one bars failure worth retrying: the server never answered, so the
+    same request may well succeed on the next attempt or another connection. A
+    plain :class:`ProtocolError` (the server rejected the request) and a
+    :class:`SymbolNotFoundError` (wrong ticker or wrong exchange) are verdicts, not
+    stalls — retrying those only burns time.
+
+    Subclasses ``ProtocolError`` so pre-existing ``except ProtocolError`` handlers
+    keep catching it, and the builtin ``TimeoutError`` to match how the streaming
+    client reports a connect timeout.
+    """
+
+
 class StreamClosedError(TradingViewError):
     """The quote stream was closed and will not reconnect."""

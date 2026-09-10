@@ -1,6 +1,6 @@
 [project]
 name = "tradingview-sdk"
-version = "0.2.0"
+version = "0.3.0"
 description = "Unofficial Python SDK for TradingView: quotes, streaming prices, historical bars, screeners, and community strategies"
 readme = "README.md"
 requires-python = ">=3.11"

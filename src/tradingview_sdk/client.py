@@ -12,7 +12,7 @@ import httpx
 from ._http import BASE_HEADERS, RequestSpec, execute_async, execute_sync
 from ._sync import run_coro_blocking
 from .auth import AuthTokenCache, Credentials
-from .bars import DEFAULT_BARS, Adjustment, Interval, fetch_bars
+from .bars import DEFAULT_BAR_TIMEOUT, DEFAULT_BARS, Adjustment, Interval, fetch_bars
 from .errors import SymbolNotFoundError
 from .models import (
     BarSet,
@@ -116,12 +116,26 @@ class AsyncTradingView:
         start: datetime | date | int | float | None = None,
         end: datetime | date | int | float | None = None,
         adjustment: str | Adjustment = Adjustment.SPLITS,
+        timeout: float = DEFAULT_BAR_TIMEOUT,
     ) -> BarSet:
         """Historical OHLCV bars for "EXCHANGE:TICKER" (bare tickers are resolved via search).
 
         ``bars`` is the number of most-recent candles; pass ``start`` (and optionally
         ``end``) to page back over a date range instead. Uses a one-shot chart-session
         websocket; anonymous access returns delayed data.
+
+        ``timeout`` (default :data:`~tradingview_sdk.DEFAULT_BAR_TIMEOUT`, 5s) is this
+        call's websocket silence watchdog, separate from the constructor's ``timeout``,
+        which is the HTTP read timeout for the REST endpoints. Raising one does not
+        raise the other. It bounds the chart-session handshake and each wait for the
+        next frame, so a stalled server costs ~``timeout`` plus a one-second close
+        grace per attempt and raises :class:`~tradingview_sdk.BarTimeoutError`. It does not cover the REST work that
+        may precede the session: resolving a bare ticker through ``search_symbols`` and
+        the first websocket-token fetch both run under the constructor's ``timeout``.
+
+        An unknown symbol, or a real ticker on the wrong exchange, raises
+        ``SymbolNotFoundError`` as soon as the server rejects it — typically well under
+        a second, never after waiting out the watchdog.
         """
         symbol = await self._resolve_symbol(symbol)
         return await fetch_bars(
@@ -132,6 +146,7 @@ class AsyncTradingView:
             end=end,
             adjustment=adjustment,
             auth=self._auth,
+            timeout=timeout,
         )
 
     async def _resolve_symbol(self, symbol: str) -> str:
@@ -257,7 +272,13 @@ class TradingView:
         start: datetime | date | int | float | None = None,
         end: datetime | date | int | float | None = None,
         adjustment: str | Adjustment = Adjustment.SPLITS,
+        timeout: float = DEFAULT_BAR_TIMEOUT,
     ) -> BarSet:
+        """See :meth:`AsyncTradingView.get_bars`.
+
+        ``timeout`` is the websocket silence watchdog for this call (default
+        :data:`~tradingview_sdk.DEFAULT_BAR_TIMEOUT`), not the constructor's HTTP timeout.
+        """
         symbol = self._resolve_symbol(symbol)
         return run_coro_blocking(
             fetch_bars(
@@ -268,6 +289,7 @@ class TradingView:
                 end=end,
                 adjustment=adjustment,
                 auth=self._auth,
+                timeout=timeout,
             )
         )
 
