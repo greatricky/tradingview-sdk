@@ -237,8 +237,8 @@ Tagging a version runs `.github/workflows/release.yml`, which builds and publish
 
 ```bash
 # bump `version` in pyproject.toml (the single source of truth), then:
-git commit -am "Release v0.3.0"
-git tag v0.3.0
+git commit -am "Release v0.3.1"
+git tag v0.3.1
 git push origin main --tags
 ```
 

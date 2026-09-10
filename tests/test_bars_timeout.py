@@ -1,5 +1,10 @@
 """The get_bars facades' silence watchdog: pass-through, validation, error type."""
 
+import asyncio
+import base64
+import hashlib
+from contextlib import asynccontextmanager
+
 import pytest
 
 from tradingview_sdk import AsyncTradingView, BarTimeoutError, ProtocolError, TradingView
@@ -45,70 +50,76 @@ async def test_non_positive_timeout_is_rejected(bad):
         await fetch_bars(symbol="X:Y", auth=AuthTokenCache(Credentials()), timeout=bad)
 
 
+async def _accept_websocket(reader, writer) -> None:
+    """Answer the opening handshake so the client believes it has a live session."""
+    request = await reader.readuntil(b"\r\n\r\n")
+    key = ""
+    for line in request.decode(errors="replace").split("\r\n"):
+        if line.lower().startswith("sec-websocket-key:"):
+            key = line.split(":", 1)[1].strip()
+    digest = hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+    writer.write(
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+        b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + base64.b64encode(digest) + b"\r\n\r\n"
+    )
+    await writer.drain()
+
+
+@asynccontextmanager
+async def _silent_server(*, handshake: bool):
+    """A server that accepts the connection and then never speaks — not even to close.
+
+    The handler parks on ``read()`` rather than sleeping a fixed time. Python 3.12's
+    ``Server.wait_closed()`` blocks until every handler returns (3.11 and 3.14 return
+    immediately), so a sleeping handler hangs the whole suite there for its full
+    duration; waiting for EOF ends the handler the moment the client disconnects, on
+    every version.
+    """
+
+    async def handler(reader, writer):
+        try:
+            if handshake:
+                await _accept_websocket(reader, writer)
+            await reader.read()          # silent; returns only once the client goes away
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    try:
+        yield f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}/socket.io/websocket"
+    finally:
+        server.close()
+        # Bounded: a socket the SDK failed to drop should fail this test, not hang it.
+        await asyncio.wait_for(server.wait_closed(), timeout=10)
+
+
 async def test_connect_timeout_raises_bar_timeout_error():
     # A host that accepts TCP but never completes the websocket handshake must be
     # bounded by `timeout` too, not by websockets' own 10s open_timeout default.
-    import asyncio
-
-    server = await asyncio.start_server(lambda r, w: asyncio.sleep(60), "127.0.0.1", 0)
-    url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}/socket.io/websocket"
-    try:
-        loop = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
+    async with _silent_server(handshake=False) as url:
         began = loop.time()
         with pytest.raises(BarTimeoutError, match="connecting"):
             await fetch_bars(
                 symbol="X:Y", auth=AuthTokenCache(Credentials()), url=url, timeout=0.5
             )
         assert loop.time() - began < 5.0        # not websockets' 10s open_timeout
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
-async def _stalling_ws_server():
-    """Completes the websocket handshake, then never speaks again — including on close."""
-    import asyncio
-    import base64
-    import hashlib
-
-    async def handler(reader, writer):
-        request = await reader.readuntil(b"\r\n\r\n")
-        key = ""
-        for line in request.decode(errors="replace").split("\r\n"):
-            if line.lower().startswith("sec-websocket-key:"):
-                key = line.split(":", 1)[1].strip()
-        digest = hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
-        writer.write(
-            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-            b"Connection: Upgrade\r\nSec-WebSocket-Accept: "
-            + base64.b64encode(digest)
-            + b"\r\n\r\n"
-        )
-        await writer.drain()
-        await asyncio.sleep(300)
-
-    return await asyncio.start_server(handler, "127.0.0.1", 0)
 
 
 async def test_stalled_session_does_not_pay_the_close_handshake_on_top():
     # A server that goes silent mid-session ignores the closing handshake too. websockets
     # would wait out its own close_timeout there, which made a 5s watchdog cost 15s wall
     # clock — most of the stall budget spent after the decision to give up was made.
-    import asyncio
-
-    server = await _stalling_ws_server()
-    url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}/socket.io/websocket"
-    try:
-        loop = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
+    async with _silent_server(handshake=True) as url:
         began = loop.time()
         with pytest.raises(BarTimeoutError, match="waiting for bars"):
             await fetch_bars(
                 symbol="X:Y", auth=AuthTokenCache(Credentials()), url=url, timeout=1.0
             )
         elapsed = loop.time() - began
-    finally:
-        server.close()
-        await server.wait_closed()
     # The watchdog plus the close grace, nowhere near websockets' 10s close_timeout.
     assert elapsed < 1.0 + _CLOSE_GRACE + 1.0, f"stall cost {elapsed:.1f}s"
 
