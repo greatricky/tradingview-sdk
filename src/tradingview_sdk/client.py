@@ -116,14 +116,23 @@ class AsyncTradingView:
         start: datetime | date | int | float | None = None,
         end: datetime | date | int | float | None = None,
         adjustment: str | Adjustment = Adjustment.SPLITS,
+        session: str | None = None,
         timeout: float = DEFAULT_BAR_TIMEOUT,
         deadline: float | None = None,
+        strict: bool = False,
     ) -> BarSet:
         """Historical OHLCV bars for "EXCHANGE:TICKER" (bare tickers are resolved via search).
 
         ``bars`` is the number of most-recent candles; pass ``start`` (and optionally
         ``end``) to page back over a date range instead. Uses a one-shot chart-session
         websocket; anonymous access returns delayed data.
+
+        ``session`` selects the trading session the candles are built from:
+        ``"regular"`` or ``"extended"``. Left ``None`` it is not sent and the server
+        picks, which is the request every earlier release made. The result's
+        ``timezone`` and ``session`` fields report what the server resolved — the
+        exchange zone its bar stamps are in and the trading-hours string — with the
+        whole ``symbol_resolved`` reply on ``raw["symbol_resolved"]``.
 
         ``timeout`` (default :data:`~tradingview_sdk.DEFAULT_BAR_TIMEOUT`, 5s) is this
         call's websocket silence watchdog, separate from the constructor's ``timeout``,
@@ -139,7 +148,17 @@ class AsyncTradingView:
         loose backstop derived from ``timeout`` — high enough that a legitimate
         multi-round ``start=`` range never meets it, present so that a server which
         stays busy without ever finishing cannot hang the caller. Bars that already
-        arrived come back with ``raw["truncated"] = True`` either way.
+        arrived come back with ``raw["truncated"] = True`` either way — unless
+        ``strict=True``, which raises :class:`~tradingview_sdk.IncompleteBarsError`
+        (a ``BarTimeoutError`` carrying that partial set on ``.bars``) instead, for a
+        caller that must never mistake a short answer for a whole one. The same
+        flag marks a fetch that used up its pagination rounds before covering
+        the range asked for.
+
+        Each load round arrives as one websocket frame — up to roughly 2 MB for a
+        full chunk — that has to land within ``timeout``, so on a slow link (under
+        about 3.5 Mbps) a deep series or large ``start=`` range can trip the
+        watchdog with the server perfectly healthy; raise ``timeout`` there.
 
         Neither one covers resolving a bare ticker through ``search_symbols``, which
         happens before the session opens and runs under the constructor's ``timeout``.
@@ -158,9 +177,11 @@ class AsyncTradingView:
             start=start,
             end=end,
             adjustment=adjustment,
+            session=session,
             auth=self._auth,
             timeout=timeout,
             deadline=deadline,
+            strict=strict,
         )
 
     async def _resolve_symbol(self, symbol: str) -> str:
@@ -286,8 +307,10 @@ class TradingView:
         start: datetime | date | int | float | None = None,
         end: datetime | date | int | float | None = None,
         adjustment: str | Adjustment = Adjustment.SPLITS,
+        session: str | None = None,
         timeout: float = DEFAULT_BAR_TIMEOUT,
         deadline: float | None = None,
+        strict: bool = False,
     ) -> BarSet:
         """See :meth:`AsyncTradingView.get_bars`.
 
@@ -306,9 +329,11 @@ class TradingView:
                 start=start,
                 end=end,
                 adjustment=adjustment,
+                session=session,
                 auth=self._auth,
                 timeout=timeout,
                 deadline=deadline,
+                strict=strict,
             )
         )
 

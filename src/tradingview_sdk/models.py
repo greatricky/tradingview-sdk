@@ -217,12 +217,23 @@ class Bar:
 
 @dataclass(frozen=True, slots=True)
 class BarSet:
-    """Historical OHLCV bars for one instrument, oldest first."""
+    """Historical OHLCV bars for one instrument, oldest first.
+
+    ``timezone`` and ``session`` come from the server's ``symbol_resolved`` reply.
+    A bar's ``time`` is its open stamped in the EXCHANGE's zone (``timezone``,
+    e.g. ``"America/Chicago"`` for CBOE) and read back as a UTC epoch, so a daily
+    bar of a symbol whose session opens in the evening — or whose ``session``
+    string runs past midnight (``"1700-1600"``) — lands on a different calendar
+    date than the day it is fully known. Both fields exist so a caller that dates
+    bars can decide that for itself; the whole reply is on ``raw["symbol_resolved"]``.
+    """
 
     symbol: str                       # "SP:SPX"
     interval: str                     # resolution, e.g. "1D", "60"
     bars: tuple[Bar, ...]
     currency: str | None = None
+    timezone: str | None = None       # exchange timezone of the bar stamps, e.g. "America/New_York"
+    session: str | None = None        # trading-hours string, e.g. "0930-1600"
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
     def __iter__(self):

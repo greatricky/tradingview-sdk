@@ -8,6 +8,8 @@ from tradingview_sdk._chart import (
     parse_timescale_update,
     request_more_data_params,
     resolve_symbol_params,
+    symbol_currency,
+    symbol_info,
     symbol_spec,
 )
 from tradingview_sdk._protocol import decode_frame, encode_message, parse_json_message
@@ -101,6 +103,42 @@ def test_bar_datetime_is_utc():
 
 def test_empty_barset_last_is_none():
     assert BarSet(symbol="X:Y", interval="1D", bars=()).last is None
+
+
+def test_barset_resolved_fields_default_to_none():
+    # Added in 0.5.0 with defaults so every earlier keyword construction still works.
+    bs = BarSet(symbol="X:Y", interval="1D", bars=())
+    assert bs.timezone is None and bs.session is None
+
+
+# --- symbol_resolved metadata -----------------------------------------------
+
+_RESOLVED = {
+    "currency_code": "USD",
+    "timezone": "America/Chicago",
+    "session": "0215-0826,0830-1516",
+    "type": "index",
+}
+
+
+def test_symbol_info_returns_the_whole_description():
+    params = ["cs_1", "sds_sym_1", _RESOLVED]
+    assert symbol_info(params) is _RESOLVED
+    assert symbol_currency(params) == "USD"
+
+
+@pytest.mark.parametrize(
+    "params",
+    [[], ["cs_1"], ["cs_1", "sds_sym_1"], ["cs_1", "sds_sym_1", "not-a-dict"], {"m": "x"}],
+)
+def test_symbol_info_is_empty_on_any_other_shape(params):
+    assert symbol_info(params) == {}
+    assert symbol_currency(params) is None
+
+
+def test_symbol_currency_key_fallbacks_are_unchanged():
+    assert symbol_currency(["cs", "sym", {"currency-id": "EUR"}]) == "EUR"
+    assert symbol_currency(["cs", "sym", {"currency_id": "GBP"}]) == "GBP"
 
 
 def test_to_dataframe():

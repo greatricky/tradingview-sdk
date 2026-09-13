@@ -105,9 +105,12 @@ with TradingView() as tv:
   - `Adjustment.DIVIDENDS` → split-adjusted and dividend-adjusted.
 
   Splits are always applied (there is no split-off mode), and the latest bar is identical either way — only historical bars change.
+- `session` picks the trading session the candles are built from: `"regular"` or `"extended"`. Leave it unset and the server decides (the request every earlier release sent).
 - Each `Bar` has `time` (epoch seconds, UTC), `open`/`high`/`low`/`close`/`volume`, and a `.datetime` (aware UTC). `BarSet` is iterable/indexable with `.last`, `.closes`, `.times`, … and a lazy `.to_dataframe()` (needs pandas only if you call it). Bar times are always UTC, and a naive `start`/`end` `datetime` is interpreted as UTC.
+- `BarSet.timezone` and `BarSet.session` are what the server resolved the symbol to: the exchange timezone its bar stamps are in (`"America/Chicago"` for CBOE) and its trading-hours string (`"0930-1600"`; `"1700-1600"` for a futures session that runs overnight). A daily bar is stamped at its session *open* in that zone, so for an evening-opening or overnight session the UTC date of `Bar.time` is not the day the bar is fully known — these two fields are what lets you date bars correctly. The whole `symbol_resolved` reply is on `raw["symbol_resolved"]`.
 - Bars load over a websocket chart session; anonymous access returns delayed data (log in for realtime — see [Authentication](#authentication-optional)).
-- `timeout` (default 5s) is a silence watchdog on the websocket session: it re-arms on every frame that carries progress, and heartbeats deliberately do not count, so a session that stays chatty without delivering bars still trips it. `deadline` is the total seconds the call may take, defaulting to a loose backstop derived from `timeout` — high enough that a legitimate multi-round `start=` range never meets it, there so a server that stays busy without ever finishing cannot hang you. Either one raises `BarTimeoutError`, the one bars failure worth retrying. A wrong ticker or exchange raises `SymbolNotFoundError` straight away, and a range that ends midway returns what it got with `raw["truncated"] == True`.
+- `timeout` (default 5s) is a silence watchdog on the websocket session: it re-arms on every frame that carries progress, and heartbeats deliberately do not count, so a session that stays chatty without delivering bars still trips it. `deadline` is the total seconds the call may take, defaulting to a loose backstop derived from `timeout` — high enough that a legitimate multi-round `start=` range never meets it, there so a server that stays busy without ever finishing cannot hang you. Either one raises `BarTimeoutError`, the one bars failure worth retrying. A wrong ticker or exchange raises `SymbolNotFoundError` straight away, and a range that ends midway returns what it got with `raw["truncated"] == True` — or, with `strict=True`, raises `IncompleteBarsError` (a `BarTimeoutError` with the partial set on `.bars`), for callers that must never file a short answer as a whole one.
+- Each load round arrives as one websocket frame of up to ~2 MB that has to land within `timeout`, so on a slow link (under ~3.5 Mbps) a deep series or a large `start=` range can trip the watchdog with the server perfectly healthy — raise `timeout` there.
 
 **Streaming bars** — `BarStream` mirrors `QuoteStream` for live, updating candles:
 
@@ -246,7 +249,7 @@ The workflow guards that the tag matches the package version, runs the offline t
 
 ## Error handling
 
-All errors derive from `TradingViewError`: `HTTPStatusError` (with `RateLimitError` for 429 and `AuthRequiredError` for 401/403), `SymbolNotFoundError`, `ParseError` (markup drift), `ProtocolError` (with `BarTimeoutError` for a chart session that stalled — the one bars failure worth retrying), and `StreamClosedError`. Every model keeps the raw payload on `.raw` so new upstream fields remain accessible.
+All errors derive from `TradingViewError`: `HTTPStatusError` (with `RateLimitError` for 429 and `AuthRequiredError` for 401/403), `SymbolNotFoundError`, `ParseError` (markup drift), `ProtocolError` (with `BarTimeoutError` for a chart session that stalled — the one bars failure worth retrying — and its subclass `IncompleteBarsError` when `strict=True` refuses a partial load), and `StreamClosedError`. Every model keeps the raw payload on `.raw` so new upstream fields remain accessible.
 
 ## License
 

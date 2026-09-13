@@ -113,3 +113,27 @@ def test_ascii_frames_skip_the_astral_scan():
     assert _has_astral('{"a":1}') is False
     assert _has_astral("삼성전자") is False          # BMP: one char, one code unit
     assert _has_astral('{"n":"🚀"}') is True
+
+
+def test_truncated_payload_is_dropped_and_logged(caplog):
+    # A declared length running past the message end means the server split one
+    # ~m~ message across websocket messages, which this decoder does not reassemble.
+    # The payload must be dropped LOUDLY, not returned truncated for the JSON parse
+    # to discard in silence — and the whole payloads before it must survive.
+    whole = encode_message("series_completed", ["cs", "sds_1"])
+    cut = encode_message("timescale_update", ["cs", {"sds_1": {"s": [{"i": 0, "v": [1, 2, 3, 4, 5]}]}}])[:-20]
+    with caplog.at_level("WARNING", logger="tradingview_sdk.protocol"):
+        assert decode_frame(whole + cut) == decode_frame(whole)
+    assert len(caplog.records) == 1
+    assert "dropped a ~m~ payload" in caplog.records[0].message
+
+
+def test_truncated_astral_payload_is_dropped_and_logged(caplog):
+    # Same guard on the UTF-16 path, which counts an astral character as two units.
+    payload = '{"m":"x","p":["\U0001F600 abc"]}'
+    whole = wrap_raw(payload)
+    with caplog.at_level("WARNING", logger="tradingview_sdk.protocol"):
+        assert decode_frame(whole) == [payload]
+        assert decode_frame(whole[:-3]) == []
+    assert len(caplog.records) == 1
+

@@ -9,7 +9,13 @@ from contextlib import asynccontextmanager
 import pytest
 import websockets
 
-from tradingview_sdk import AsyncTradingView, BarTimeoutError, ProtocolError, TradingView
+from tradingview_sdk import (
+    AsyncTradingView,
+    BarTimeoutError,
+    IncompleteBarsError,
+    ProtocolError,
+    TradingView,
+)
 from tradingview_sdk import bars as bars_module
 from tradingview_sdk import client as client_module
 from tradingview_sdk._chart import SERIES_ID
@@ -347,6 +353,36 @@ async def test_async_get_bars_passes_the_deadline_through(capture_fetch):
         await tv.get_bars("X:Y", "1D", bars=3)
         await tv.get_bars("X:Y", "1D", bars=3, deadline=7.5)
     assert [c["deadline"] for c in capture_fetch] == [None, 7.5]
+
+
+def test_sync_get_bars_passes_session_and_strict_through(capture_fetch):
+    with TradingView() as tv:
+        tv.get_bars("X:Y", "1D", bars=3)
+        tv.get_bars("X:Y", "1D", bars=3, session="regular", strict=True)
+    assert [(c["session"], c["strict"]) for c in capture_fetch] == [(None, False), ("regular", True)]
+
+
+async def test_async_get_bars_passes_session_and_strict_through(capture_fetch):
+    async with AsyncTradingView() as tv:
+        await tv.get_bars("X:Y", "1D", bars=3)
+        await tv.get_bars("X:Y", "1D", bars=3, session="extended", strict=True)
+    assert [(c["session"], c["strict"]) for c in capture_fetch] == [(None, False), ("extended", True)]
+
+
+async def test_strict_promotes_the_deadline_partial_result_to_an_error():
+    # The deadline path takes the same bargain as the watchdog; strict refuses it
+    # the same way, and the error carries exactly what the lenient call returns.
+    payload = wrap_raw(json.dumps({"m": "series_loading", "p": ["cs", SERIES_ID]}))
+    times = [1_700_000_000 - i * 86_400 for i in range(3)]
+    server = _NeverCompletes(payload=payload, bars=sorted(times))
+    async with _chart_server(server) as url:
+        with pytest.raises(IncompleteBarsError) as info:
+            await fetch_bars(
+                symbol="X:Y", auth=AuthTokenCache(Credentials()), url=url,
+                timeout=1.0, deadline=1.5, strict=True,
+            )
+    assert [b.time for b in info.value.bars] == sorted(times)
+    assert info.value.bars.raw["truncated"] is True
 
 
 async def test_a_deadline_tighter_than_the_watchdog_wins_and_says_so():

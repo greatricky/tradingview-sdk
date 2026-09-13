@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .models import BarSet
+
 
 class TradingViewError(Exception):
     """Base class for all tradingview_sdk errors."""
@@ -60,6 +65,27 @@ class BarTimeoutError(ProtocolError, TimeoutError):
     keep catching it, and the builtin ``TimeoutError`` to match how the streaming
     client reports a connect timeout.
     """
+
+
+class IncompleteBarsError(BarTimeoutError):
+    """A chart session stalled or hit its deadline AFTER some bars had arrived.
+
+    Raised only by ``fetch_bars(strict=True)`` / ``get_bars(strict=True)``; the
+    default mode returns the partial set flagged ``raw["truncated"] = True``
+    instead. ``bars`` is exactly that partial :class:`~tradingview_sdk.BarSet`, so
+    a caller that wants it still has it. Subclasses :class:`BarTimeoutError`
+    because the remedy is the same — retry — and a session that produced nothing
+    at all still raises the plain parent.
+    """
+
+    def __init__(self, message: str, bars: BarSet):
+        self.bars = bars
+        super().__init__(message)
+
+    def __reduce__(self):
+        # ``bars`` is not in ``args``, so the default reduce would rebuild this
+        # without it; matters when the error crosses a process boundary.
+        return type(self), (self.args[0], self.bars)
 
 
 class StreamClosedError(TradingViewError):

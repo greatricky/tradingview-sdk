@@ -20,6 +20,7 @@ from .errors import (
     AuthRequiredError,
     BarTimeoutError,
     HTTPStatusError,
+    IncompleteBarsError,
     ParseError,
     ProtocolError,
     RateLimitError,
@@ -116,5 +117,6 @@ __all__ = [
     "ParseError",
     "ProtocolError",
     "BarTimeoutError",
+    "IncompleteBarsError",
     "StreamClosedError",
 ]

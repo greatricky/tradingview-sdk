@@ -18,6 +18,7 @@ from ._chart import (
     request_more_data_params,
     resolve_symbol_params,
     symbol_currency,
+    symbol_info,
 )
 from ._http import BASE_HEADERS
 from ._protocol import (
@@ -31,13 +32,22 @@ from ._protocol import (
     wrap_raw,
 )
 from .auth import AuthTokenCache, resolve_ws_token
-from .errors import BarTimeoutError, ProtocolError, SymbolNotFoundError
+from .errors import BarTimeoutError, IncompleteBarsError, ProtocolError, SymbolNotFoundError
 from .models import Bar, BarSet
 
 logger = logging.getLogger("tradingview_sdk.bars")
 
 DEFAULT_BARS = 300
-_PER_REQUEST = 5000     # bars asked for per create_series / request_more_data round
+# Bars asked for per create_series / request_more_data round. A chunk size, not
+# a server limit: measured 2026-09-13 over anonymous chart sessions, a single
+# 60 000-bar create_series returned every bar the server holds — all 20 005 of
+# TVC:SPX (1871-02-01 on), 9 260 of CBOE:VIX, 11 523 of NASDAQ:AAPL — and the
+# same at 20 000 for intraday (BINANCE:BTCUSDT "60" and "1"). So the round size
+# only trades round trips against frame size: ~104 bytes per bar puts a full
+# round near 2 MB, well inside ``max_size`` and about 3.5 Mbps to land within
+# the default watchdog, while making every daily series reachable anonymously a
+# one-round fetch. It was 5000 (~520 KB, 5 rounds for SPX) through 0.4.0.
+_PER_REQUEST = 20_000
 _MAX_ROUNDS = 20        # safety cap on request_more_data pagination
 _CLOSE_GRACE = 1.0      # seconds spent on the closing handshake before dropping the socket
 _DEADLINE_FLOOR = 30.0  # smallest derived total deadline, however tight `timeout` is
@@ -57,10 +67,10 @@ reconnects and resumes, while a one-shot fetch just gives up, so waiting longer
 buys nothing and callers who try several exchanges per symbol pay it each time.
 
 Each wait covers a whole websocket message rather than idle time alone, because
-that is the granularity ``recv()`` offers. A 5000-bar load round arrives as one
-~520 KB frame, which needs a link under roughly 1 Mbps to take 5s — so on a
-congested or tethered connection a large ``start=`` range may need a bigger
-``timeout`` even though the server is healthy.
+that is the granularity ``recv()`` offers. A full :data:`_PER_REQUEST` load round
+arrives as one frame of roughly 2 MB, which needs a link under about 3.5 Mbps to
+take 5s — so on a congested or tethered connection a deep series or a large
+``start=`` range may need a bigger ``timeout`` even though the server is healthy.
 
 Heartbeats deliberately do not count as progress. The server sends them every few
 seconds and this client echoes them back to stay connected, so a watchdog re-armed
@@ -158,6 +168,7 @@ class _Load:
     symbol: str
     collected: dict[int, Bar] = field(default_factory=dict)
     currency: str | None = None
+    resolved: dict[str, Any] = field(default_factory=dict)  # the symbol_resolved reply
 
 
 async def fetch_bars(
@@ -168,16 +179,27 @@ async def fetch_bars(
     start: datetime | date | int | float | None = None,
     end: datetime | date | int | float | None = None,
     adjustment: str | Adjustment = Adjustment.SPLITS,
+    session: str | None = None,
     auth: AuthTokenCache,
     url: str = WS_URL,
     timeout: float = DEFAULT_BAR_TIMEOUT,
     deadline: float | None = None,
+    strict: bool = False,
 ) -> BarSet:
     """Fetch historical OHLCV bars for ``symbol`` over one chart-session websocket.
 
     ``bars`` is the number of most-recent bars to return. Pass ``start`` (and
     optionally ``end``) to page back until that time is covered; ``start`` then
     takes precedence over the ``bars`` count. Times are epoch seconds UTC.
+
+    ``session`` names the trading session the bars are built from — ``"regular"``
+    or ``"extended"`` — and is sent in the ``resolve_symbol`` spec. ``None`` omits
+    it and leaves the choice to the server, which is exactly the request every
+    earlier release sent, so existing fetches do not move.
+
+    The reply's ``symbol_resolved`` description is kept: ``BarSet.timezone`` and
+    ``BarSet.session`` are the exchange timezone and trading-hours string, and the
+    whole dict sits on ``raw["symbol_resolved"]``.
 
     ``timeout`` is the silence watchdog in seconds (see
     :data:`DEFAULT_BAR_TIMEOUT`), applied to the handshake and then to each wait
@@ -189,6 +211,11 @@ async def fetch_bars(
     raises :class:`BarTimeoutError`; if it ends after some arrived, the bars
     collected so far are returned with ``raw["truncated"] = True`` rather than
     thrown away, so check that flag before treating a result as a complete answer.
+    ``strict=True`` turns that second case into an :class:`IncompleteBarsError`
+    (a ``BarTimeoutError`` carrying the partial set on ``.bars``) — for a caller
+    that records what it fetches and must never file a short answer as a whole one.
+    The same flag (and error) marks a fetch that spent all :data:`_MAX_ROUNDS`
+    pagination rounds without reaching ``start`` or ``bars``.
     """
     if timeout is None or timeout <= 0:
         # Reachable from the public get_bars facades: asyncio.timeout(None) would
@@ -244,7 +271,10 @@ async def fetch_bars(
         await send("set_auth_token", [token])
         await send("chart_create_session", [cs, ""])
         await send("switch_timezone", [cs, "Etc/UTC"])
-        await send("resolve_symbol", resolve_symbol_params(cs, symbol, adjustment=adjustment))
+        await send(
+            "resolve_symbol",
+            resolve_symbol_params(cs, symbol, adjustment=adjustment, session=session),
+        )
         await send("create_series", create_series_params(cs, interval, initial))
 
         rounds = 0
@@ -280,7 +310,18 @@ async def fetch_bars(
                 reached_start = (
                     start_ts is not None and earliest is not None and earliest <= start_ts
                 )
-                if have_enough_count or reached_start or rounds >= _MAX_ROUNDS:
+                if have_enough_count or reached_start:
+                    break
+                if rounds >= _MAX_ROUNDS:
+                    # The cap is a guard against runaway pagination, not a result: the
+                    # server still had more and the caller's range is not covered, so
+                    # this is a shortfall like a stall, and strict mode must see it.
+                    truncated = True
+                    logger.warning(
+                        "chart session for %r hit the %d-round cap before covering its "
+                        "range; returning %d bars",
+                        symbol, _MAX_ROUNDS, len(load.collected),
+                    )
                     break
 
                 before = len(load.collected)
@@ -310,17 +351,33 @@ async def fetch_bars(
     elif len(ordered) > bars:
         ordered = ordered[-bars:]
 
-    return BarSet(
+    result = BarSet(
         symbol=symbol,
         interval=interval,
         bars=tuple(ordered),
         currency=load.currency,
+        timezone=_optional_str(load.resolved.get("timezone")),
+        session=_optional_str(load.resolved.get("session")),
         raw={
             "chart_session_rounds": rounds,
             "bar_count": len(ordered),
             "truncated": truncated,
+            "symbol_resolved": load.resolved,
         },
     )
+    if truncated and strict:
+        # Built first so the error carries exactly what the lenient mode returns.
+        raise IncompleteBarsError(
+            f"chart session for {symbol!r} ended after {len(ordered)} bar(s) without "
+            f"finishing; strict mode refuses a partial answer",
+            bars=result,
+        )
+    return result
+
+
+def _optional_str(value: Any) -> str | None:
+    """A non-empty string from the server's dict, else None — never a stray type."""
+    return value if isinstance(value, str) and value else None
 
 
 async def _close_quietly(ws: Any, grace: float = _CLOSE_GRACE) -> None:
@@ -405,6 +462,9 @@ async def _read_until_completed(
                 for bar in parse_timescale_update(params, SERIES_ID):
                     load.collected[bar.time] = bar
             elif method == "symbol_resolved":
+                # Kept whole: timezone and session decide how a caller may date a
+                # bar, and fields this client does not model stay reachable on raw.
+                load.resolved = load.resolved or symbol_info(params)
                 load.currency = load.currency or symbol_currency(params)
             elif method == "series_completed":
                 completed = True  # finish the frame first: more bars may follow it

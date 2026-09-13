@@ -11,8 +11,13 @@ from tradingview_sdk._chart import SERIES_ID
 from tradingview_sdk._protocol import decode_frame, parse_json_message, wrap_raw
 from tradingview_sdk.auth import AuthTokenCache, Credentials
 from tradingview_sdk.bar_stream import BarStream
-from tradingview_sdk.bars import fetch_bars
-from tradingview_sdk.errors import BarTimeoutError, ProtocolError, SymbolNotFoundError
+from tradingview_sdk.bars import _MAX_ROUNDS, fetch_bars
+from tradingview_sdk.errors import (
+    BarTimeoutError,
+    IncompleteBarsError,
+    ProtocolError,
+    SymbolNotFoundError,
+)
 
 BAR_SECONDS = 86_400
 NEWEST = 1_700_000_000
@@ -29,12 +34,16 @@ class FakeChartServer:
         symbol_error: bool = False,
         symbol_error_reason: str | None = None,
         bad_bar: bool = False,
+        symbol_meta: dict | None = None,
     ):
         self.history = history
         self.per_round = per_round
         self.symbol_error = symbol_error
         self.symbol_error_reason = symbol_error_reason
         self.bad_bar = bad_bar
+        # What symbol_resolved describes the instrument as; the bare default is what
+        # every pre-0.5.0 test replied with.
+        self.symbol_meta = {"currency_code": "USD"} if symbol_meta is None else symbol_meta
         self.rounds = 0
         self.served = 0
         self.received: list[dict] = []
@@ -85,7 +94,7 @@ class FakeChartServer:
                             )))
                             continue
                         await ws.send(wrap_raw(json.dumps(
-                            {"m": "symbol_resolved", "p": [params[0], params[1], {"currency_code": "USD"}]}
+                            {"m": "symbol_resolved", "p": [params[0], params[1], self.symbol_meta]}
                         )))
                     elif method in ("create_series", "request_more_data"):
                         await self._load_round(ws, params[0])
@@ -191,6 +200,143 @@ async def test_complete_load_is_not_flagged_as_truncated():
     server = FakeChartServer(history=40, per_round=5)
     result = await asyncio.wait_for(_fetch(server, interval="1D", bars=5), timeout=20)
     assert result.raw["truncated"] is False
+
+
+async def test_strict_turns_a_truncated_load_into_an_error_carrying_the_bars():
+    # Same stall as above. A caller that records what it fetches cannot afford to
+    # forget the flag, so strict mode makes the shortfall an exception — one that
+    # still hands over what arrived and is still retryable as a BarTimeoutError.
+    server = FakeChartServer(history=40, per_round=5)
+    original = server._load_round
+    calls = 0
+
+    async def stall_after_first(ws, chart_session):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return
+        await original(ws, chart_session)
+
+    server._load_round = stall_after_first
+    start = NEWEST - 30 * BAR_SECONDS
+    with pytest.raises(IncompleteBarsError, match="partial") as info:
+        await asyncio.wait_for(
+            _fetch(server, interval="1D", start=start, timeout=0.3, strict=True), timeout=20
+        )
+    partial = info.value.bars
+    assert 0 < len(partial) < 30
+    assert partial.raw["truncated"] is True
+    assert partial.currency == "USD"
+    assert isinstance(info.value, BarTimeoutError)
+
+
+async def test_strict_with_nothing_collected_is_still_the_plain_timeout():
+    # Nothing to attach, so nothing to promote: the parent class, as before.
+    server = FakeChartServer(history=0, per_round=0)
+    server._load_round = lambda ws, cs: asyncio.sleep(0)
+    with pytest.raises(BarTimeoutError) as info:
+        await asyncio.wait_for(
+            _fetch(server, interval="1D", bars=5, timeout=0.3, strict=True), timeout=20
+        )
+    assert not isinstance(info.value, IncompleteBarsError)
+
+
+async def test_strict_does_not_touch_a_complete_load():
+    server = FakeChartServer(history=40, per_round=5)
+    result = await asyncio.wait_for(_fetch(server, interval="1D", bars=5, strict=True), timeout=20)
+    assert len(result) == 5 and result.raw["truncated"] is False
+
+
+async def test_round_cap_before_start_is_flagged_truncated():
+    # 200 bars of history at 5 a round: `start` 150 days back needs 30 rounds, but
+    # the cap stops paging at _MAX_ROUNDS. The server never stalled, so nothing
+    # else marks the shortfall — the cap exit has to, or the `start` filter below
+    # it hides a 105-bar answer to a 151-bar question as complete.
+    server = FakeChartServer(history=200, per_round=5)
+    start = NEWEST - 150 * BAR_SECONDS
+    result = await asyncio.wait_for(_fetch(server, interval="1D", start=start), timeout=20)
+    assert server.rounds == _MAX_ROUNDS + 1                # create_series + the capped pages
+    assert 0 < len(result) < 151
+    assert result.bars[0].time > start
+    assert result.raw["truncated"] is True
+    assert result.raw["chart_session_rounds"] == _MAX_ROUNDS
+
+
+async def test_strict_refuses_a_round_capped_load():
+    server = FakeChartServer(history=200, per_round=5)
+    start = NEWEST - 150 * BAR_SECONDS
+    with pytest.raises(IncompleteBarsError) as info:
+        await asyncio.wait_for(_fetch(server, interval="1D", start=start, strict=True), timeout=20)
+    assert info.value.bars.raw["truncated"] is True
+    assert 0 < len(info.value.bars) < 151
+
+
+async def test_round_cap_on_a_bars_count_is_flagged_truncated():
+    # The same cap on the `bars=` path: more bars asked for than the rounds can
+    # carry, with history still left, is a short answer too.
+    server = FakeChartServer(history=200, per_round=5)
+    result = await asyncio.wait_for(_fetch(server, interval="1D", bars=150), timeout=20)
+    assert 0 < len(result) < 150
+    assert result.raw["truncated"] is True
+
+
+async def test_reaching_start_exactly_at_the_cap_is_not_truncated():
+    # The cap only counts when the range is still uncovered: a fetch whose last
+    # allowed round reaches `start` is complete, however many rounds it took.
+    server = FakeChartServer(history=200, per_round=5)
+    covered = 5 * (_MAX_ROUNDS + 1)                        # bars the cap can carry
+    start = NEWEST - (covered - 1) * BAR_SECONDS
+    result = await asyncio.wait_for(_fetch(server, interval="1D", start=start), timeout=20)
+    assert len(result) == covered
+    assert result.bars[0].time == start
+    assert result.raw["truncated"] is False
+
+
+# --- symbol_resolved metadata and the session spec ---------------------------
+
+_CBOE_VIX = {
+    "currency_code": "USD",
+    "timezone": "America/Chicago",
+    "session": "0215-0826,0830-1516",
+    "type": "index",
+    "description": "CBOE Volatility Index",
+}
+
+
+async def test_result_carries_the_resolved_timezone_and_session():
+    # A daily bar is stamped at its session open in the exchange's own zone, so a
+    # caller dating bars needs both of these — they were dropped before 0.5.0.
+    server = FakeChartServer(history=5, symbol_meta=_CBOE_VIX)
+    result = await asyncio.wait_for(_fetch(server, interval="1D", bars=5), timeout=20)
+    assert result.timezone == "America/Chicago"
+    assert result.session == "0215-0826,0830-1516"
+    assert result.currency == "USD"
+    assert result.raw["symbol_resolved"] == _CBOE_VIX     # the whole reply, unmodelled fields included
+
+
+async def test_missing_or_malformed_resolved_fields_read_as_none():
+    server = FakeChartServer(history=5, symbol_meta={"currency_code": "USD", "timezone": "", "session": 7})
+    result = await asyncio.wait_for(_fetch(server, interval="1D", bars=5), timeout=20)
+    assert result.timezone is None and result.session is None
+
+
+def _resolve_spec(server: FakeChartServer) -> str:
+    (msg,) = [m for m in server.received if m["m"] == "resolve_symbol"]
+    return msg["p"][2]
+
+
+async def test_session_is_sent_in_the_resolve_spec_when_asked_for():
+    server = FakeChartServer(history=5)
+    await asyncio.wait_for(_fetch(server, interval="1D", bars=5, session="regular"), timeout=20)
+    assert _resolve_spec(server) == '={"adjustment":"splits","symbol":"X:Y","session":"regular"}'
+
+
+async def test_default_resolve_spec_is_byte_identical_to_earlier_releases():
+    # `session=None` must not change the wire request: a series someone has been
+    # fetching since 0.1.0 has to keep coming back the same.
+    server = FakeChartServer(history=5)
+    await asyncio.wait_for(_fetch(server, interval="1D", bars=5), timeout=20)
+    assert _resolve_spec(server) == '={"adjustment":"splits","symbol":"X:Y"}'
 
 
 # --- BarStream over the same fake chart session -----------------------------

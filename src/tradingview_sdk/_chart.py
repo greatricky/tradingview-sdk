@@ -121,9 +121,21 @@ parse_timescale_update = parse_series_bars
 parse_du = parse_series_bars
 
 
+def symbol_info(params: list[Any]) -> dict[str, Any]:
+    """The instrument description a ``symbol_resolved`` message carries, or ``{}``.
+
+    ``p`` is ``[chart_session, symbol_id, {...}]``; the dict is the server's own
+    account of the symbol — currency, ``timezone`` (the exchange zone its bar
+    stamps are in), ``session`` (the trading-hours string, e.g. ``"0930-1600"``),
+    type, description and more. Returned whole so callers can read fields this
+    client does not model.
+    """
+    if not isinstance(params, list) or len(params) < 3 or not isinstance(params[2], dict):
+        return {}
+    return params[2]
+
+
 def symbol_currency(params: list[Any]) -> str | None:
     """Best-effort currency code from a ``symbol_resolved`` message's ``p`` list."""
-    if len(params) < 3 or not isinstance(params[2], dict):
-        return None
-    meta = params[2]
+    meta = symbol_info(params)
     return meta.get("currency_code") or meta.get("currency-id") or meta.get("currency_id")

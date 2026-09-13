@@ -15,10 +15,13 @@ units in JavaScript and one in Python, and those take the slower walk below.
 from __future__ import annotations
 
 import json
+import logging
 import random
 import re
 import string
 from typing import Any
+
+logger = logging.getLogger("tradingview_sdk.protocol")
 
 _FRAME_RE = re.compile(r"~m~(\d+)~m~")
 _HEARTBEAT_RE = re.compile(r"^~h~\d+$")
@@ -50,7 +53,17 @@ def wrap_raw(payload: str) -> str:
 
 
 def decode_frame(frame: str | bytes) -> list[str]:
-    """Split one websocket frame into its ``~m~``-framed payloads."""
+    """Split one websocket message into its ``~m~``-framed payloads.
+
+    Stateless by design: RFC 6455 has the websocket library reassemble fragmented
+    frames into whole messages before ``recv()`` returns, and the server puts each
+    ``~m~`` message inside one websocket message — measured 2026-09-13 on the
+    largest payloads it produces (a 1.9 MB ``timescale_update`` of 20 005 TVC:SPX
+    bars arrived whole, as did every other). A payload whose declared length runs
+    past the end of the message is therefore a protocol change, not a normal
+    split; it is dropped and logged, never returned truncated, so a JSON parse
+    downstream cannot quietly discard bars.
+    """
     text = frame.decode("utf-8", "replace") if isinstance(frame, (bytes, bytearray)) else frame
     if _has_astral(text):
         return _decode_utf16(text)
@@ -76,9 +89,21 @@ def _decode_chars(text: str) -> list[str]:
             break
         start = m.end()
         end = start + int(m.group(1))
+        if end > len(text):
+            _warn_truncated(int(m.group(1)), len(text) - start)
+            break
         messages.append(text[start:end])
         pos = end
     return messages
+
+
+def _warn_truncated(declared: int, available: int) -> None:
+    logger.warning(
+        "dropped a ~m~ payload declaring %d units with only %d in the websocket "
+        "message; the server split a message across websocket messages, which this "
+        "decoder does not reassemble",
+        declared, available,
+    )
 
 
 def _decode_utf16(text: str) -> list[str]:
@@ -95,6 +120,9 @@ def _decode_utf16(text: str) -> list[str]:
         while end < len(text) and consumed < units:
             consumed += 2 if text[end] > "￿" else 1
             end += 1
+        if consumed < units:
+            _warn_truncated(units, consumed)
+            break
         messages.append(text[start:end])
         pos = end
     return messages
