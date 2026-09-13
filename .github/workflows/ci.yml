@@ -42,13 +42,20 @@ jobs:
         with:
           enable-cache: true
 
+      # Pinned to the requires-python floor. Without it `uv venv` takes the newest
+      # interpreter on the runner, for which the oldest allowed wheels (selectolax
+      # 0.3.10 has none past cp311) don't exist, and the job fails building from
+      # sdist instead of testing anything.
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
       # Deliberately not `uv sync`/`uv run` without --no-sync: both would restore
       # uv.lock and quietly test the newest versions again. Test tooling is left at
       # its newest, and the `pandas` extra out entirely — its one test importorskips,
       # and pinning it low only reproduces pandas' own numpy-2 ABI break, not ours.
       - name: Install the lowest allowed runtime dependencies
         run: |
-          uv venv
+          uv venv --python 3.11
           uv pip install --resolution lowest-direct .
           uv pip install pytest pytest-asyncio
 
