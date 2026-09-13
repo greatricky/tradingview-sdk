@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Sequence
 
@@ -9,6 +10,8 @@ from ._protocol import WS_URL, generate_session_id
 from ._stream import _StreamBase
 from .auth import Credentials
 from .models import QuoteUpdate
+
+logger = logging.getLogger("tradingview_sdk.ws")
 
 DEFAULT_WS_FIELDS: tuple[str, ...] = (
     "lp",            # last price
@@ -70,7 +73,7 @@ class QuoteStream(_StreamBase[QuoteUpdate]):
         """Add symbols ("EXCHANGE:TICKER") to the stream."""
         new = [s for s in symbols if s not in self._desired]
         self._desired.update(new)
-        if new and self._ws is not None:
+        if new and self.is_connected:
             await self._send("quote_add_symbols", [self._session_id, *new])
 
     async def unsubscribe(self, *symbols: str) -> None:
@@ -80,7 +83,7 @@ class QuoteStream(_StreamBase[QuoteUpdate]):
         for s in present:
             self._snapshots.pop(s, None)
             self._completed.discard(s)
-        if present and self._ws is not None:
+        if present and self.is_connected:
             await self._send("quote_remove_symbols", [self._session_id, *present])
 
     @property
@@ -99,8 +102,21 @@ class QuoteStream(_StreamBase[QuoteUpdate]):
         await self._send("set_auth_token", [token])
         await self._send("quote_create_session", [self._session_id])
         await self._send("quote_set_fields", [self._session_id, *self._fields])
-        if self._desired:
-            await self._send("quote_add_symbols", [self._session_id, *sorted(self._desired)])
+        # Re-derived after every send rather than read once: a subscribe or
+        # unsubscribe that lands while a send here is parked (backpressure) sees
+        # is_connected False and leaves it to this loop, so the loop has to notice.
+        added: set[str] = set()
+        while True:
+            new = sorted(self._desired - added)
+            gone = sorted(added - self._desired)
+            if not new and not gone:
+                return
+            if new:
+                added.update(new)
+                await self._send("quote_add_symbols", [self._session_id, *new])
+            if gone:
+                added.difference_update(gone)
+                await self._send("quote_remove_symbols", [self._session_id, *gone])
 
     def _handle_data(self, method: str | None, params: list[Any]) -> None:
         if method == "qsd":
@@ -113,8 +129,19 @@ class QuoteStream(_StreamBase[QuoteUpdate]):
             return
         body = params[1]
         symbol = body.get("n")
+        if not symbol:
+            return
+        if body.get("s") == "error":
+            # An unknown symbol answers with status "error", errmsg "no_such_symbol"
+            # and an empty "v" (measured 2026-09-13). Dispatching that would hand
+            # consumers a QuoteUpdate with no changes and no snapshot. Checked before
+            # "v" so the warning is not lost if the error frame carries no "v" at all.
+            logger.warning(
+                "quote for %r failed: %s", symbol, body.get("errmsg") or str(body)[:200]
+            )
+            return
         values = body.get("v")
-        if not symbol or not isinstance(values, dict):
+        if not isinstance(values, dict):
             return
         snap = self._snapshots.setdefault(symbol, {})
         snap.update(values)

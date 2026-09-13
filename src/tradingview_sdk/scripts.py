@@ -6,7 +6,7 @@ import html
 import json
 import re
 from typing import Any, Callable, Iterator
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from selectolax.parser import HTMLParser
 
@@ -78,18 +78,35 @@ def find_in_init_data(html: str, predicate: Callable[[Any], bool]) -> Any:
 # Listing
 # ---------------------------------------------------------------------------
 
+def listing_path(page: int) -> str:
+    return "/scripts/" if page <= 1 else f"/scripts/page-{page}/"
+
+
 def build_listing_request(page: int = 1, script_type: str = "strategies") -> RequestSpec:
     if script_type not in SCRIPT_TYPES:
         raise ValueError(
             f"invalid script_type {script_type!r}; expected one of {', '.join(SCRIPT_TYPES)}"
         )
-    path = "/scripts/" if page <= 1 else f"/scripts/page-{page}/"
     return RequestSpec(
         "GET",
-        f"{BASE_URL}{path}",
+        f"{BASE_URL}{listing_path(page)}",
         params={"script_type": script_type},
         headers={"Accept": "text/html"},
     )
+
+
+def listing_page_served(final_url: str, page: int) -> bool:
+    """Whether the listing response at ``final_url`` is really ``page``.
+
+    A page number past the last one is answered with a redirect to ``/scripts/``
+    (measured 2026-09-13: the strategies listing ends at page 42, and page 43 came
+    back as page 1 with ``next`` set), so the page must be checked against where
+    the redirect landed, not against what was asked for.
+    """
+    path = urlsplit(final_url).path
+    if page <= 1:
+        return path in ("/scripts/", "/scripts/page-1/")
+    return path == listing_path(page)
 
 
 def _card_from_item(item: dict[str, Any]) -> StrategyCard:
@@ -114,12 +131,17 @@ def _card_from_item(item: dict[str, Any]) -> StrategyCard:
     )
 
 
-def parse_listing_page(html: str, page: int = 1) -> StrategyPage:
+def parse_listing_page(html: str, page: int = 1, *, final_url: str | None = None) -> StrategyPage:
     """Parse a /scripts/ listing page into cards.
 
     Prefers the embedded init-data JSON (rich card data); falls back to
-    scraping ``/script/<slug>`` anchors when the blob is absent.
+    scraping ``/script/<slug>`` anchors when the blob is absent. Pass the URL the
+    response actually came from as ``final_url``: a page past the end redirects
+    to page 1, and that is reported as an empty last page rather than as page 1's
+    cards under the wrong number.
     """
+    if final_url is not None and not listing_page_served(final_url, page):
+        return StrategyPage(cards=[], page=page, has_next=False)
     ideas = find_in_init_data(
         html,
         lambda o: isinstance(o, dict) and "items" in o and "total" in o and isinstance(o.get("items"), list),
@@ -241,15 +263,14 @@ def _find_report_data(chart_content: Any) -> dict[str, Any] | None:
 def parse_script_page(html: str, slug_or_url: str) -> Strategy:
     slug, url = normalize_script_url(slug_or_url)
     # A deleted or access-restricted script still carries the key, with a null value.
-    idea = find_in_init_data(
-        html,
-        lambda o: isinstance(o, dict) and isinstance(o.get("ssrIdeaData"), dict),
-    )
-    if not idea:
+    holder = find_in_init_data(html, lambda o: isinstance(o, dict) and "ssrIdeaData" in o)
+    if holder is None:
         raise ParseError(
             f"Could not find script data on {url}; TradingView markup may have changed."
         )
-    idea = idea["ssrIdeaData"]
+    idea = holder["ssrIdeaData"]
+    if not isinstance(idea, dict):
+        raise ParseError(f"Script {slug!r} is not available (deleted, hidden, or restricted).")
     script = idea.get("script") or {}
     user = idea.get("user") or {}
     symbol = idea.get("symbol") or {}

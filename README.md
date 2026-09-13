@@ -72,6 +72,7 @@ asyncio.run(main())
 - `stream.on_update(callback)` — sync or async callback alternative; returns an unregister function.
 - `stream.snapshot("NASDAQ:AAPL")` — latest merged field values.
 - Reconnects automatically with exponential backoff and **resubscribes everything** after a drop.
+- A symbol the server does not know is logged as a warning and never yields an update; the rest of the stream is unaffected.
 
 ### Historical bars (OHLCV)
 
@@ -105,9 +106,9 @@ with TradingView() as tv:
   - `Adjustment.DIVIDENDS` → split-adjusted and dividend-adjusted.
 
   Splits are always applied (there is no split-off mode), and the latest bar is identical either way — only historical bars change.
-- `session` picks the trading session the candles are built from: `"regular"` or `"extended"`. Leave it unset and the server decides (the request every earlier release sent).
+- `session` picks the trading session the candles are built from: `"regular"` or `"extended"`. Leave it unset and the server decides (the request every earlier release sent). Only intraday bars follow it — daily and longer bars are always built from the regular session, even though `BarSet.session` then reports the extended hours.
 - Each `Bar` has `time` (epoch seconds, UTC), `open`/`high`/`low`/`close`/`volume`, and a `.datetime` (aware UTC). `BarSet` is iterable/indexable with `.last`, `.closes`, `.times`, … and a lazy `.to_dataframe()` (needs pandas only if you call it). Bar times are always UTC, and a naive `start`/`end` `datetime` is interpreted as UTC.
-- `BarSet.timezone` and `BarSet.session` are what the server resolved the symbol to: the exchange timezone its bar stamps are in (`"America/Chicago"` for CBOE) and its trading-hours string (`"0930-1600"`; `"1700-1600"` for a futures session that runs overnight). A daily bar is stamped at its session *open* in that zone, so for an evening-opening or overnight session the UTC date of `Bar.time` is not the day the bar is fully known — these two fields are what lets you date bars correctly. The whole `symbol_resolved` reply is on `raw["symbol_resolved"]`.
+- `BarSet.timezone` and `BarSet.session` are what the server resolved the symbol to: the exchange timezone its bar stamps are in (`"America/Chicago"` for CBOE) and its trading-hours string (`"0930-1600"`; `"1700-1600"` for a futures session that runs overnight). A daily bar is stamped at its *regular* session open in that zone, so for an evening-opening or overnight session (CME futures, FX) the UTC date of `Bar.time` is the day *before* the bar is fully known — these two fields are what lets you date bars correctly. The whole `symbol_resolved` reply is on `raw["symbol_resolved"]`.
 - Bars load over a websocket chart session; anonymous access returns delayed data (log in for realtime — see [Authentication](#authentication-optional)).
 - `timeout` (default 5s) is a silence watchdog on the websocket session: it re-arms on every frame that carries progress, and heartbeats deliberately do not count, so a session that stays chatty without delivering bars still trips it. `deadline` is the total seconds the call may take, defaulting to a loose backstop derived from `timeout` — high enough that a legitimate multi-round `start=` range never meets it, there so a server that stays busy without ever finishing cannot hang you. Either one raises `BarTimeoutError`, the one bars failure worth retrying. A wrong ticker or exchange raises `SymbolNotFoundError` straight away, and a range that ends midway returns what it got with `raw["truncated"] == True` — or, with `strict=True`, raises `IncompleteBarsError` (a `BarTimeoutError` with the partial set on `.bars`), for callers that must never file a short answer as a whole one.
 - Each load round arrives as one websocket frame of up to ~2 MB that has to land within `timeout`, so on a slow link (under ~3.5 Mbps) a deep series or a large `start=` range can trip the watchdog with the server perfectly healthy — raise `timeout` there.
@@ -121,13 +122,14 @@ from tradingview_sdk import BarStream
 async def main():
     async with BarStream() as stream:
         await stream.subscribe("BINANCE:BTCUSDT", "1")   # 1-minute bars
+        # same options as get_bars: adjustment="dividends", session="extended"
         async for u in stream.updates():
             print(u.symbol, u.interval, u.bar.close, "closed" if u.closed else "forming")
 
 asyncio.run(main())
 ```
 
-Each `BarUpdate` carries the latest `bar` and `closed` — `False` while the bar is still forming, `True` once a newer bar has started.
+Each `BarUpdate` carries the latest `bar` and `closed` — `False` while the bar is still forming, `True` once a newer bar has started. A series the server rejects (unknown symbol, or an interval it does not support) is dropped from `subscriptions` with a warning; the other series keep streaming.
 
 ### Screeners
 
@@ -181,7 +183,8 @@ Each `FieldInfo` carries: `name`, `type` (semantics: `percent` = percentage poin
 from tradingview_sdk import TradingView
 
 with TradingView() as tv:
-    # List open-source strategies (paginated; also: tv.iter_strategies())
+    # List open-source strategies (paginated; also: tv.iter_strategies(), which
+    # walks to the last page; a page number past the end is an empty page)
     page = tv.list_strategies()
     for card in page:
         print(card.title, card.author, card.likes, card.url)
@@ -192,6 +195,7 @@ with TradingView() as tv:
 
     r = s.report                      # the "Strategy report" from the script page
     print(r.all.net_profit, r.all.total_trades, r.all.profit_factor)
+    print(r.all.percent_profitable)   # ratios are fractions: 0.5568 means 55.68%
     print(r.max_drawdown, r.sharpe_ratio, r.sortino_ratio)
     print(r.trades[:2])               # individual trades
     print(r.buy_hold_curve[:5])       # buy & hold equity curve

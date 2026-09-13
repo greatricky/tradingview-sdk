@@ -75,7 +75,9 @@ def _check_response(resp: httpx.Response) -> httpx.Response:
 
 
 def _retryable(exc: Exception) -> bool:
-    if isinstance(exc, (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError)):
+    # Every request this SDK makes is a read, so a retry after a torn connection or
+    # a timeout at any stage (pool, connect, write, read) cannot double-apply anything.
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)):
         return True
     return isinstance(exc, HTTPStatusError) and not isinstance(exc, (RateLimitError, AuthRequiredError)) and exc.status >= 500
 

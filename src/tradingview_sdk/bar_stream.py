@@ -15,6 +15,7 @@ with :class:`~tradingview_sdk.ws.QuoteStream` via
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,7 +24,10 @@ from ._chart import SERIES_ID, create_series_params, parse_series_bars, resolve_
 from ._protocol import WS_URL, generate_session_id
 from ._stream import _StreamBase
 from .auth import Credentials
+from .bars import Adjustment
 from .models import Bar, BarUpdate
+
+logger = logging.getLogger("tradingview_sdk.bar_stream")
 
 DEFAULT_STREAM_BARS = 300  # history requested when a series is created
 
@@ -35,6 +39,8 @@ class _Series:
     symbol: str
     interval: str
     bars: int
+    adjustment: str = Adjustment.SPLITS
+    session: str | None = None
     chart_session: str = ""      # assigned each time the series is (re)created
     last_time: int | None = field(default=None)
     last_bar: Bar | None = field(default=None)
@@ -67,14 +73,36 @@ class BarStream(_StreamBase[BarUpdate]):
 
     # ------------------------------------------------------------------ API
 
-    async def subscribe(self, symbol: str, interval: str = "1D", *, bars: int = DEFAULT_STREAM_BARS) -> None:
-        """Add a (symbol, interval) series to the stream."""
+    async def subscribe(
+        self,
+        symbol: str,
+        interval: str = "1D",
+        *,
+        bars: int = DEFAULT_STREAM_BARS,
+        adjustment: str | Adjustment = Adjustment.SPLITS,
+        session: str | None = None,
+    ) -> None:
+        """Add a (symbol, interval) series to the stream.
+
+        ``adjustment`` and ``session`` mean what they do for
+        :meth:`~tradingview_sdk.AsyncTradingView.get_bars`: the chart's ADJ toggle
+        (``"splits"`` or ``"dividends"``) and the trading session the bars are built
+        from (``"regular"``, ``"extended"``, or ``None`` to let the server pick).
+        Only intraday bars follow ``session``; daily and longer are always regular.
+
+        A series is identified by ``(symbol, interval)`` alone, so a second
+        subscribe for the same pair with different options is a no-op; unsubscribe
+        it first to change them.
+        """
         key: Key = (symbol, str(interval))
         if key in self._desired:
             return
-        series = _Series(symbol=symbol, interval=str(interval), bars=bars)
+        series = _Series(
+            symbol=symbol, interval=str(interval), bars=bars,
+            adjustment=str(adjustment), session=session,
+        )
         self._desired[key] = series
-        if self._ws is not None:
+        if self.is_connected:
             await self._create_series(series)
 
     async def unsubscribe(self, symbol: str, interval: str = "1D") -> None:
@@ -85,7 +113,7 @@ class BarStream(_StreamBase[BarUpdate]):
             return
         session = series.chart_session
         self._by_session.pop(session, None)
-        if self._ws is not None and session:
+        if self.is_connected and session:
             await self._send("chart_delete_session", [session])
 
     @property
@@ -102,8 +130,16 @@ class BarStream(_StreamBase[BarUpdate]):
     async def _handshake(self, token: str) -> None:
         self._by_session.clear()  # sessions from a previous connection are gone
         await self._send("set_auth_token", [token])
-        for series in list(self._desired.values()):
-            await self._create_series(series)
+        # Re-derived after every series rather than snapshotted once: a subscribe or
+        # unsubscribe that lands while a send here is parked (backpressure) sees
+        # is_connected False and leaves it to this loop, so the loop has to notice.
+        while True:
+            pending = [s for s in self._desired.values() if s.chart_session not in self._by_session]
+            if not pending:
+                return
+            for series in pending:
+                if self._desired.get((series.symbol, series.interval)) is series:
+                    await self._create_series(series)
 
     async def _create_series(self, series: _Series) -> None:
         """Give the series its own chart session — TradingView allows one series per session."""
@@ -113,12 +149,50 @@ class BarStream(_StreamBase[BarUpdate]):
         self._by_session[chart_session] = series
         await self._send("chart_create_session", [chart_session, ""])
         await self._send("switch_timezone", [chart_session, "Etc/UTC"])
-        await self._send("resolve_symbol", resolve_symbol_params(chart_session, series.symbol))
+        await self._send(
+            "resolve_symbol",
+            resolve_symbol_params(
+                chart_session, series.symbol, adjustment=series.adjustment, session=series.session
+            ),
+        )
         await self._send("create_series", create_series_params(chart_session, series.interval, series.bars))
 
     def _handle_data(self, method: str | None, params: list[Any]) -> None:
         if method in ("timescale_update", "du"):
             self._route_bars(params, historical=(method == "timescale_update"))
+        elif method in ("symbol_error", "series_error"):
+            self._fail_series(method, params)
+
+    def _absorb_error(self, method: str, params: list[Any]) -> bool:
+        # A critical_error carrying one of our chart-session ids is the server
+        # rejecting that one series (an interval it does not know, say). It keeps
+        # the socket and every other session running (measured 2026-09-13), so the
+        # right response is to drop the series, not the connection: reconnecting
+        # replays the same create_series, fails the same way, and loops forever
+        # with every good subscription starved in the meantime. A protocol_error is
+        # not measured to be session-scoped, so it stays fatal.
+        if method != "critical_error":
+            return False
+        session = params[0] if params and isinstance(params[0], str) else ""
+        if not session.startswith("cs_"):
+            return False
+        self._fail_series(method, params)
+        return True
+
+    def _fail_series(self, method: str | None, params: list[Any]) -> None:
+        """Drop the series a server error is addressed to, so nothing replays it."""
+        session = params[0] if params and isinstance(params[0], str) else ""
+        series = self._by_session.pop(session, None)
+        if series is None:
+            # Already unsubscribed, or an error for a session we never made; either
+            # way there is nothing to retire and nothing to tell the caller.
+            logger.debug("ignoring %s for unknown chart session %r", method, session)
+            return
+        self._desired.pop((series.symbol, series.interval), None)
+        logger.warning(
+            "dropping %r %s from the stream: server sent %s: %s",
+            series.symbol, series.interval, method, str(params[1:])[:200],
+        )
 
     def _route_bars(self, params: list[Any], *, historical: bool) -> None:
         if len(params) < 2 or not isinstance(params[1], dict):

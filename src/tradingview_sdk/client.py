@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from datetime import date, datetime
 from typing import Any, AsyncIterator, Iterator, Sequence
 
@@ -16,6 +17,7 @@ from .bars import DEFAULT_BAR_TIMEOUT, DEFAULT_BARS, Adjustment, Interval, fetch
 from .errors import SymbolNotFoundError
 from .models import (
     BarSet,
+    PineSource,
     Quote,
     ScreenerResult,
     Strategy,
@@ -40,7 +42,7 @@ from .scripts import (
     parse_pine_source,
     parse_script_page,
 )
-from .search import build_search_request, parse_search_response
+from .search import build_search_request, parse_search_response, pick_full_symbol
 
 _PAGE_DELAY = 0.5  # politeness delay between listing page fetches
 
@@ -188,12 +190,10 @@ class AsyncTradingView:
         if ":" in symbol:
             return symbol
         matches = await self.search_symbols(symbol, search_type=None)
-        for m in matches:
-            if m.symbol.upper() == symbol.upper():
-                return m.full_symbol
-        if matches:
-            return matches[0].full_symbol
-        raise SymbolNotFoundError(f"No instrument found for {symbol!r}")
+        full = pick_full_symbol(matches, symbol)
+        if full is None:
+            raise SymbolNotFoundError(f"No instrument found for {symbol!r}")
+        return full
 
     # -- screeners ---------------------------------------------------------
     async def screen(self, query: ScreenerQuery) -> ScreenerResult:
@@ -214,10 +214,11 @@ class AsyncTradingView:
 
         script_type: "strategies" (default), "indicators", "libraries", or "all"
         (see :data:`~tradingview_sdk.scripts.SCRIPT_TYPES`); anything else raises
-        ``ValueError``.
+        ``ValueError``. A page past the last one is an empty page with
+        ``has_next`` False.
         """
         resp = await self._request(build_listing_request(page, script_type))
-        return parse_listing_page(resp.text, page)
+        return parse_listing_page(resp.text, page, final_url=str(resp.url))
 
     async def iter_strategies(
         self, *, max_pages: int | None = None, script_type: str = "strategies"
@@ -242,7 +243,7 @@ class AsyncTradingView:
             strategy = _with_source(strategy, source)
         return strategy
 
-    async def get_pine_source(self, script_id_part: str):
+    async def get_pine_source(self, script_id_part: str) -> PineSource:
         resp = await self._request(build_pine_source_request(script_id_part))
         return parse_pine_source(script_id_part, resp.json())
 
@@ -341,12 +342,10 @@ class TradingView:
         if ":" in symbol:
             return symbol
         matches = self.search_symbols(symbol, search_type=None)
-        for m in matches:
-            if m.symbol.upper() == symbol.upper():
-                return m.full_symbol
-        if matches:
-            return matches[0].full_symbol
-        raise SymbolNotFoundError(f"No instrument found for {symbol!r}")
+        full = pick_full_symbol(matches, symbol)
+        if full is None:
+            raise SymbolNotFoundError(f"No instrument found for {symbol!r}")
+        return full
 
     def screen(self, query: ScreenerQuery) -> ScreenerResult:
         resp = self._request(build_screener_request(query))
@@ -366,7 +365,7 @@ class TradingView:
         ``ValueError``.
         """
         resp = self._request(build_listing_request(page, script_type))
-        return parse_listing_page(resp.text, page)
+        return parse_listing_page(resp.text, page, final_url=str(resp.url))
 
     def iter_strategies(
         self, *, max_pages: int | None = None, script_type: str = "strategies"
@@ -389,14 +388,12 @@ class TradingView:
             strategy = _with_source(strategy, source)
         return strategy
 
-    def get_pine_source(self, script_id_part: str):
+    def get_pine_source(self, script_id_part: str) -> PineSource:
         resp = self._request(build_pine_source_request(script_id_part))
         return parse_pine_source(script_id_part, resp.json())
 
 
-def _with_source(strategy: Strategy, source) -> Strategy:
-    from dataclasses import replace
-
+def _with_source(strategy: Strategy, source: PineSource) -> Strategy:
     return replace(strategy, source=source)
 
 

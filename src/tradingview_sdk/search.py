@@ -35,6 +35,29 @@ def build_search_request(
     return RequestSpec("GET", SEARCH_URL, params=params)
 
 
+def pick_full_symbol(matches: list[SymbolInfo], text: str) -> str | None:
+    """The ``EXCHANGE:TICKER`` a bare ``text`` should mean, given its search results.
+
+    An exact ticker match wins over the first result. Futures are listed under
+    their root — searching ``ES1!`` returns ``CME:ES`` with the continuous and
+    dated contracts in ``raw["contracts"]`` (measured 2026-09-13) — and the root is
+    not a chartable symbol, so a contract whose ticker matches is looked for too,
+    routed by its own ``prefix`` (``CME_MINI:ES1!``) when it carries one.
+    """
+    wanted = text.upper()
+    for m in matches:
+        if m.symbol.upper() == wanted:
+            return m.full_symbol
+        for contract in m.raw.get("contracts") or ():
+            if not isinstance(contract, dict):
+                continue
+            ticker = _EM_TAG_RE.sub("", str(contract.get("symbol") or ""))
+            if ticker.upper() == wanted:
+                route = contract.get("prefix") or contract.get("exchange") or m.prefix or m.exchange
+                return f"{route}:{ticker}"
+    return matches[0].full_symbol if matches else None
+
+
 def parse_search_response(data: Any) -> list[SymbolInfo]:
     if not isinstance(data, dict) or "symbols" not in data:
         raise ParseError(f"Unexpected symbol-search response shape: {str(data)[:200]}")

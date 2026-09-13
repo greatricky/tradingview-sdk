@@ -195,6 +195,18 @@ class _StreamBase(Generic[U]):
     def is_closed(self) -> bool:
         return self._closed
 
+    @property
+    def is_connected(self) -> bool:
+        """True once the current connection's handshake has finished.
+
+        The socket exists a little earlier than this, while the handshake is still
+        in flight — a subscribe that sends on it then lands before the server-side
+        session exists (or duplicates what the handshake is about to replay), so
+        subscribe/unsubscribe key their "send now or let the handshake do it"
+        decision on this, not on the socket.
+        """
+        return self._connected.is_set()
+
     # ------------------------------------------------------------- consumers
 
     def updates(self, *symbols: str) -> AsyncIterator[U]:
@@ -345,7 +357,7 @@ class _StreamBase(Generic[U]):
             return  # server hello / non-JSON payloads
         method = data.get("m")
         params = data.get("p") or []
-        if method in FATAL_METHODS:
+        if method in FATAL_METHODS and not self._absorb_error(method, params):
             logger.warning("server sent %s: %s", method, str(params)[:200])
             raise ConnectionError(f"TradingView sent {method}")
         try:
@@ -360,6 +372,16 @@ class _StreamBase(Generic[U]):
     async def _handshake(self, token: str) -> None:
         """Authenticate and (re)create the server-side sessions on a fresh connection."""
         raise NotImplementedError
+
+    def _absorb_error(self, method: str, params: list[Any]) -> bool:
+        """Return True if a ``critical_error``/``protocol_error`` is scoped narrowly
+        enough to handle in place, so the connection is kept rather than dropped.
+
+        The default treats every one as fatal. A subclass whose server-side
+        sessions can fail independently overrides this, because reconnecting
+        would recreate the same failing session and loop forever.
+        """
+        return False
 
     def _handle_data(self, method: str | None, params: list[Any]) -> None:
         """Handle one decoded, non-fatal protocol message."""

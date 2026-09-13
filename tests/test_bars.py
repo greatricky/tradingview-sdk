@@ -241,3 +241,104 @@ def test_unparseable_points_are_skipped_and_logged(caplog):
     assert [b.time for b in bars] == [100, 400]
     assert bars[1].volume is None
     assert any("skipped 3 unparseable bar point(s) of 5" in r.getMessage() for r in caplog.records)
+
+
+# --- server errors addressed to one series ------------------------------------
+
+
+def test_barstream_drops_a_series_the_server_rejects(caplog):
+    # A critical_error carrying one of our chart-session ids means that one
+    # create_series was rejected — the socket and the other sessions stay up
+    # (measured 2026-09-13). It must retire the series, not the connection: a
+    # reconnect would replay the same request and fail forever.
+    stream, series, seen = _stream_with_series()
+    other = _Series(symbol="A:B", interval="1D", bars=10, chart_session="cs_other")
+    stream._by_session[other.chart_session] = other
+    stream._desired[(other.symbol, other.interval)] = other
+
+    absorbed = stream._absorb_error(
+        "critical_error", ["cs_test", "invalid parameters", "method: create_series"]
+    )
+    assert absorbed is True
+    assert stream.subscriptions == frozenset({("A:B", "1D")})
+    assert "cs_test" not in stream._by_session
+    assert any("dropping 'X:Y' 1D" in r.getMessage() for r in caplog.records)
+    assert seen == []
+
+
+def test_barstream_symbol_and_series_errors_drop_their_series(caplog):
+    stream, series, _ = _stream_with_series()
+    stream._handle_data("symbol_error", ["cs_test", "sds_sym_1", "invalid symbol"])
+    assert stream.subscriptions == frozenset()
+    # The series_error that follows the symbol_error finds nothing left: no second
+    # warning, no error.
+    before = len(caplog.records)
+    stream._handle_data("series_error", ["cs_test", "sds_1", "s1", "resolve error"])
+    assert len([r for r in caplog.records[before:] if r.levelname == "WARNING"]) == 0
+
+
+def test_barstream_still_treats_a_session_less_critical_error_as_fatal():
+    stream, _, _ = _stream_with_series()
+    assert stream._absorb_error("critical_error", ["not a session", "auth failed"]) is False
+    assert stream._absorb_error("critical_error", []) is False
+    # An error for a chart session we already unsubscribed is ours to ignore, not
+    # a reason to reconnect.
+    assert stream._absorb_error("critical_error", ["cs_gone", "invalid parameters"]) is True
+    assert stream.subscriptions == frozenset({("X:Y", "1D")})
+
+
+async def test_barstream_subscribe_passes_adjustment_and_session_to_resolve_symbol():
+    # The streaming chart session is the same resolve_symbol + create_series
+    # handshake fetch_bars uses, so it takes the same options.
+    stream = BarStream()
+    sent = []
+
+    async def capture(method, params):
+        sent.append((method, params))
+
+    stream._send = capture
+    stream._connected.set()   # pretend the handshake is done so subscribe sends now
+    await stream.subscribe("NASDAQ:AAPL", "60", adjustment=Adjustment.DIVIDENDS, session="extended")
+    await stream.subscribe("BINANCE:BTCUSDT", "1")
+    specs = [p[2] for m, p in sent if m == "resolve_symbol"]
+    assert specs == [
+        '={"adjustment":"dividends","symbol":"NASDAQ:AAPL","session":"extended"}',
+        '={"adjustment":"splits","symbol":"BINANCE:BTCUSDT"}',
+    ]
+    # Options ride along with the series, so a reconnect replays them.
+    sent.clear()
+    await stream._handshake("tok")
+    assert [p[2] for m, p in sent if m == "resolve_symbol"] == specs
+    # Same (symbol, interval) with other options is a no-op, as documented.
+    sent.clear()
+    await stream.subscribe("NASDAQ:AAPL", "60", session="regular")
+    assert sent == [] and stream.subscriptions == {("NASDAQ:AAPL", "60"), ("BINANCE:BTCUSDT", "1")}
+
+
+async def test_barstream_handshake_notices_subscribes_that_land_mid_handshake():
+    # A subscribe/unsubscribe that runs while the handshake is parked on a send
+    # sees is_connected False and does not send; the handshake must therefore
+    # re-read the desired set rather than replay a snapshot taken up front.
+    stream = BarStream()
+    await stream.subscribe("A:B", "1D")
+    await stream.subscribe("C:D", "1D")
+    sent = []
+
+    async def capture(method, params):
+        sent.append((method, params))
+        if method == "create_series" and not any(k == ("E:F", "1D") for k in stream.subscriptions):
+            await stream.subscribe("E:F", "1D")        # late arrival
+            await stream.unsubscribe("C:D", "1D")      # late departure
+
+    stream._send = capture
+    await stream._handshake("tok")
+    resolved = [json.loads(p[2][1:])["symbol"] for m, p in sent if m == "resolve_symbol"]
+    assert resolved == ["A:B", "E:F"]
+    assert stream.subscriptions == {("A:B", "1D"), ("E:F", "1D")}
+    assert sorted(s.symbol for s in stream._by_session.values()) == ["A:B", "E:F"]
+
+
+def test_barstream_protocol_error_stays_fatal_even_with_a_session_id():
+    stream, _, _ = _stream_with_series()
+    assert stream._absorb_error("protocol_error", ["cs_test", "wrong data"]) is False
+    assert stream.subscriptions == frozenset({("X:Y", "1D")})

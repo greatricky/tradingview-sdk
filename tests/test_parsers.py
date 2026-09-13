@@ -179,3 +179,73 @@ def test_parse_pine_source_unescapes_name():
         {"scriptName": "Setup -&gt; Trigger &amp; Exit", "source": "//@version=6", "extra": {}},
     )
     assert src.name == "Setup -> Trigger & Exit"
+
+
+# --- listing pages past the end ------------------------------------------------
+
+
+def test_listing_page_past_the_end_is_empty(fixture_text):
+    # The server redirects /scripts/page-N/ past the last page to /scripts/ and
+    # serves page 1 (measured 2026-09-13: page 43 of 42 came back as page 1 with
+    # `next` set). Trusting the body would report page 1's cards as page 43 and
+    # keep `has_next` true.
+    from tradingview_sdk.scripts import listing_page_served, parse_listing_page
+
+    html = fixture_text("listing.html")
+    page = parse_listing_page(html, 43, final_url="https://www.tradingview.com/scripts/?script_type=strategies")
+    assert page.cards == [] and page.page == 43 and page.has_next is False
+    # The same body at its own URL parses as usual.
+    assert len(parse_listing_page(html, 1, final_url="https://www.tradingview.com/scripts/?x=1")) > 0
+    assert len(parse_listing_page(html, 2, final_url="https://www.tradingview.com/scripts/page-2/")) > 0
+
+    assert listing_page_served("https://www.tradingview.com/scripts/", 1)
+    assert listing_page_served("https://www.tradingview.com/scripts/page-1/", 1)
+    assert listing_page_served("https://www.tradingview.com/scripts/page-7/?script_type=all", 7)
+    assert not listing_page_served("https://www.tradingview.com/scripts/", 7)
+    assert not listing_page_served("https://www.tradingview.com/scripts/page-70/", 7)
+
+
+def test_unavailable_script_is_reported_as_such():
+    from tradingview_sdk.errors import ParseError
+    from tradingview_sdk.scripts import parse_script_page
+
+    html = '<script type="application/prs.init-data+json">{"ssrIdeaData": null}</script>'
+    with pytest.raises(ParseError, match="not available"):
+        parse_script_page(html, "gone-slug")
+    with pytest.raises(ParseError, match="markup may have changed"):
+        parse_script_page("<html></html>", "gone-slug")
+
+
+# --- bare-ticker resolution -----------------------------------------------------
+
+
+def test_pick_full_symbol_prefers_exact_ticker_then_first():
+    from tradingview_sdk.models import SymbolInfo
+    from tradingview_sdk.search import pick_full_symbol
+
+    def info(symbol, exchange, prefix=None, contracts=None):
+        raw = {"contracts": contracts} if contracts else {}
+        return SymbolInfo(symbol, exchange, "", "stock", (), None, None, None, None, prefix=prefix, raw=raw)
+
+    assert pick_full_symbol([], "AAPL") is None
+    assert pick_full_symbol([info("AAPLX", "NYSE"), info("AAPL", "NASDAQ")], "aapl") == "NASDAQ:AAPL"
+    assert pick_full_symbol([info("AAPLX", "NYSE")], "AAPL") == "NYSE:AAPLX"
+    # A CEDEAR is displayed under BYMA but routed via its prefix.
+    assert pick_full_symbol([info("AAPL", "BYMA", prefix="BCBA")], "AAPL") == "BCBA:AAPL"
+
+
+def test_pick_full_symbol_finds_a_futures_contract_under_its_root():
+    # Searching "ES1!" lists the root CME:ES, with the contracts nested; the root
+    # is not chartable and the contract carries its own routing prefix
+    # (measured 2026-09-13).
+    from tradingview_sdk.models import SymbolInfo
+    from tradingview_sdk.search import pick_full_symbol
+
+    root = SymbolInfo("ES", "CME", "", "futures", (), None, None, None, None,
+                      raw={"contracts": [{"symbol": "ES1!", "prefix": "CME_MINI"}, {"symbol": "ESZ2026"}]})
+    other = SymbolInfo("ES", "ASX24", "", "futures", (), None, None, None, None,
+                       raw={"contracts": [{"symbol": "ES1!"}]})
+    assert pick_full_symbol([root, other], "ES1!") == "CME_MINI:ES1!"
+    assert pick_full_symbol([root, other], "ESZ2026") == "CME:ESZ2026"   # no prefix: the root's exchange
+    assert pick_full_symbol([other], "ES1!") == "ASX24:ES1!"
+    assert pick_full_symbol([root], "ES2!") == "CME:ES"                 # no match anywhere: first result

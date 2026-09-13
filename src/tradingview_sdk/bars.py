@@ -227,6 +227,15 @@ async def fetch_bars(
         # `None` means "derive one", so there is no way to ask for no deadline at all:
         # an unbounded fetch_bars is the bug this argument exists to make unreachable.
         raise ValueError(f"deadline must be a positive number of seconds, not {deadline!r}")
+    if isinstance(bars, bool) or not isinstance(bars, int) or bars < 1:
+        # bars=0 slipped through as `ordered[-0:]`, which is every bar, and a negative
+        # count sliced from the wrong end; neither is a request worth guessing at.
+        raise ValueError(f"bars must be a positive integer, not {bars!r}")
+    start_ts = to_epoch(start)
+    end_ts = to_epoch(end)
+    if start_ts is not None and end_ts is not None and end_ts < start_ts:
+        # Would silently return an empty set after paging back to `start` in full.
+        raise ValueError(f"end ({end!r}) is before start ({start!r})")
     loop = asyncio.get_running_loop()
     # Started before the token fetch so `deadline` means what it says for the caller,
     # rather than only covering the part of the call after the REST round trip.
@@ -234,12 +243,10 @@ async def fetch_bars(
 
     interval = str(interval)
     adjustment = str(adjustment)
-    start_ts = to_epoch(start)
-    end_ts = to_epoch(end)
     token = await resolve_ws_token(auth)
 
     load = _Load(symbol=symbol)
-    initial = _PER_REQUEST if start_ts is not None else min(_PER_REQUEST, max(bars, 1))
+    initial = _PER_REQUEST if start_ts is not None else min(_PER_REQUEST, bars)
 
     # open_timeout defaults to 10s in websockets, which would outlive a 5s watchdog
     # and surface as a bare TimeoutError; bind both ends of the attempt to `timeout`,

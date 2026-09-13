@@ -328,3 +328,76 @@ async def test_close_still_propagates_the_callers_cancellation():
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+async def test_unknown_symbol_is_logged_not_dispatched(caplog):
+    # The server answers an unknown symbol with status "error", errmsg
+    # "no_such_symbol" and an empty "v" (measured 2026-09-13). Dispatching that
+    # would hand consumers an update with no changes and an empty snapshot.
+    stream = QuoteStream()
+    seen = []
+    stream.on_update(seen.append)
+    stream._handle_data(
+        "qsd", ["qs_x", {"n": "NASDAQ:NOPE", "s": "error", "errmsg": "no_such_symbol", "v": {}}]
+    )
+    assert seen == []
+    assert stream.snapshot("NASDAQ:NOPE") is None
+    assert any("no_such_symbol" in r.getMessage() for r in caplog.records)
+
+
+async def test_subscribe_during_handshake_defers_to_the_handshake(fake_server):
+    # Between the socket opening and the handshake finishing, a subscribe must not
+    # send: quote_add_symbols before quote_create_session is a protocol error, and
+    # the handshake replays the desired set anyway.
+    server, url = fake_server
+    stream = QuoteStream(url=url)
+    original = stream._handshake
+
+    async def slow_handshake(token):
+        await stream.subscribe("A:B")          # socket is up, session is not
+        assert not stream.is_connected
+        await original(token)
+
+    stream._handshake = slow_handshake
+    async with stream:
+        assert stream.is_connected
+        async with asyncio.timeout(5):
+            async for update in stream.updates("A:B"):
+                break
+    adds = [m for m in server.received if m["m"] == "quote_add_symbols"]
+    assert len(adds) == 1 and adds[0]["p"][1:] == ["A:B"]
+    methods = [m["m"] for m in server.received]
+    assert methods.index("quote_create_session") < methods.index("quote_add_symbols")
+
+
+async def test_handshake_notices_subscribes_that_land_mid_handshake():
+    # Same as above, but for the window after the handshake has read the desired
+    # set: a subscribe/unsubscribe parked behind a slow send must still be
+    # applied to this connection rather than waiting for the next reconnect.
+    stream = QuoteStream()
+    await stream.subscribe("A:B", "C:D")
+    sent = []
+
+    async def capture(method, params):
+        sent.append((method, params))
+        if method == "quote_add_symbols" and "E:F" not in stream.subscriptions:
+            await stream.subscribe("E:F")
+            await stream.unsubscribe("C:D")
+
+    stream._send = capture
+    await stream._handshake("tok")
+    tail = [(m, p[1:]) for m, p in sent if m in ("quote_add_symbols", "quote_remove_symbols")]
+    assert tail == [
+        ("quote_add_symbols", ["A:B", "C:D"]),
+        ("quote_add_symbols", ["E:F"]),
+        ("quote_remove_symbols", ["C:D"]),
+    ]
+
+
+async def test_unknown_symbol_without_values_is_still_logged(caplog):
+    stream = QuoteStream()
+    seen = []
+    stream.on_update(seen.append)
+    stream._handle_data("qsd", ["qs_x", {"n": "NASDAQ:NOPE", "s": "error", "errmsg": "no_such_symbol"}])
+    assert seen == []
+    assert any("no_such_symbol" in r.getMessage() for r in caplog.records)

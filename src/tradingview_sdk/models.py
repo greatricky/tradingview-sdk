@@ -117,7 +117,13 @@ class StrategyPage:
 
 @dataclass(frozen=True, slots=True)
 class StrategyStats:
-    """Performance stats for one trade group ("all", "long", or "short")."""
+    """Performance stats for one trade group ("all", "long", or "short").
+
+    Ratios are fractions, not percentage points, as the report publishes them:
+    ``percent_profitable=0.5568`` is 55.68% and ``net_profit_percent=0.0827`` is
+    8.27% (measured 2026-09-13). This is the opposite convention from the
+    screener's ``percent`` fields, which use points.
+    """
 
     net_profit: float | None
     net_profit_percent: float | None
@@ -143,7 +149,7 @@ class StrategyReport:
     long: StrategyStats | None        # long trades only
     short: StrategyStats | None       # short trades only
     max_drawdown: float | None
-    max_drawdown_percent: float | None
+    max_drawdown_percent: float | None   # a fraction (0.219 = 21.9%), like StrategyStats
     sharpe_ratio: float | None
     sortino_ratio: float | None
     open_pl: float | None
@@ -226,6 +232,12 @@ class BarSet:
     string runs past midnight (``"1700-1600"``) — lands on a different calendar
     date than the day it is fully known. Both fields exist so a caller that dates
     bars can decide that for itself; the whole reply is on ``raw["symbol_resolved"]``.
+
+    Daily and longer bars are built from the regular session regardless of the
+    ``session`` asked for: NASDAQ:AAPL with ``session="extended"`` reports
+    ``session="0400-2000"`` yet stamps its daily bars at 09:30 New York and
+    carries regular-hours volume (measured 2026-09-13). Only intraday bars move
+    to the extended session.
     """
 
     symbol: str                       # "SP:SPX"

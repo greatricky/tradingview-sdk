@@ -376,3 +376,21 @@ async def test_end_without_start_pages_back_to_fill_the_count():
     assert len(result) == 5
     assert all(b.time <= end for b in result)
     assert result.bars[-1].time == end
+
+
+# --- argument validation ------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [0, -3, 2.5, True, None])
+async def test_bars_must_be_a_positive_integer(bad):
+    server = FakeChartServer(history=40, per_round=5)
+    with pytest.raises(ValueError, match="bars must be a positive integer"):
+        await _fetch(server, interval="1D", bars=bad)
+
+
+async def test_end_before_start_is_rejected():
+    # Would otherwise page all the way back to `start` and return an empty set.
+    server = FakeChartServer(history=40, per_round=5)
+    with pytest.raises(ValueError, match="before start"):
+        await _fetch(server, interval="1D", start=NEWEST, end=NEWEST - BAR_SECONDS)
+    assert server.rounds == 0
